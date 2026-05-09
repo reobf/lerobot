@@ -203,6 +203,21 @@ class SmolVLMWithExpertModel(nn.Module):
         image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
         return image_hidden_states
 
+    def embed_image_raw(self, image: torch.Tensor):
+        """Return raw SigLIP output WITHOUT connector (no PixelShuffle/MLP).
+        Output: (B, 256, 1152) for 16x16 patches.
+        """
+        patch_attention_mask = None
+        image_hidden_states = (
+            self.get_vlm_model()
+            .vision_model(
+                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
+                patch_attention_mask=patch_attention_mask,
+            )
+            .last_hidden_state
+        )
+        return image_hidden_states
+
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
@@ -550,6 +565,20 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+
+        # ======================== ATTENTION PROBE HOOK ========================
+        # 当外部代码 (e.g. modeling_smolvla.py 的 embed_prefix) 设置
+        # self._probe_attn = True 时, 把每个 layer 的 attention probs 缓存到
+        # self._probe_attn_buf, 由外部代码消费. 不设置时零开销 (no detach, no
+        # store), 不影响生产训练.
+        # ----------------------------------------------------------------------
+        if getattr(self, "_probe_attn", False):
+            if not hasattr(self, "_probe_attn_buf"):
+                self._probe_attn_buf = []
+            # detach 避免梯度图保留 attention probs (大内存占用)
+            self._probe_attn_buf.append(probs.detach())
+        # ======================================================================
+
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))

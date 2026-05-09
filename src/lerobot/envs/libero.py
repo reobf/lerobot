@@ -133,6 +133,14 @@ class LiberoEnv(gym.Env):
         self.is_libero_plus = is_libero_plus
         self.obs_type = obs_type
         self.render_mode = render_mode
+
+        # Depth dump 配置（通过环境变量控制）
+        self._depth_dump_enabled = os.environ.get("LIBERO_DUMP_DEPTH", "0") == "1"
+        self._depth_dump_dir = Path(os.environ.get("LIBERO_DEPTH_DIR", "./depth_dumps"))
+        self._depth_frame_counter = 0
+        if self._depth_dump_enabled:
+            self._depth_dump_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[DepthDump] Enabled for task_id={task_id}. Dir: {self._depth_dump_dir}")
         self.observation_width = observation_width
         self.observation_height = observation_height
         self.visualization_width = visualization_width
@@ -185,12 +193,20 @@ class LiberoEnv(gym.Env):
         )
         self.control_mode = control_mode
         images = {}
+        depth_spaces = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
                 low=0,
                 high=255,
                 shape=(self.observation_height, self.observation_width, 3),
                 dtype=np.uint8,
+            )
+            # depth: 单通道 float32, 值域 [0, 1]
+            depth_spaces[self.camera_name_mapping[cam]] = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(self.observation_height, self.observation_width),
+                dtype=np.float32,
             )
 
         if self.obs_type == "state":
@@ -203,12 +219,14 @@ class LiberoEnv(gym.Env):
             self.observation_space = spaces.Dict(
                 {
                     "pixels": spaces.Dict(images),
+                    "depths": spaces.Dict(depth_spaces),
                 }
             )
         elif self.obs_type == "pixels_agent_pos":
             self.observation_space = spaces.Dict(
                 {
                     "pixels": spaces.Dict(images),
+                    "depths": spaces.Dict(depth_spaces),
                     "robot_state": spaces.Dict(
                         {
                             "eef": spaces.Dict(
@@ -254,30 +272,106 @@ class LiberoEnv(gym.Env):
         its own clean EGL context rather than inheriting a stale one from the
         parent process (which causes EGL_BAD_CONTEXT crashes with AsyncVectorEnv).
         """
-        if self._env is not None:
+        if self._env is not None and hasattr(self._env, 'env') and self._env.env is not None:
             return
+        print(f"[DEBUG] Rebuilding env (self._env={self._env is not None})")
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
             camera_widths=self.observation_width,
+            camera_depths=True,  # 启用深度渲染，obs 中会多出 {camera_name}_depth 键
         )
+        extent = env.sim.model.stat.extent
+        znear = env.sim.model.vis.map.znear * extent     # ← 修复 stat.extent
+        zfar = env.sim.model.vis.map.zfar * extent
+        import os
+        os.environ['LIBERO_ZNEAR'] = str(znear)
+        os.environ['LIBERO_ZFAR'] = str(zfar)
+        print(f"[LIBERO env] depth params (from MuJoCo): znear={znear}, zfar={zfar} → env var set")
         env.reset()
         self._env = env
+      
 
     def render(self):
         self._ensure_env()
         raw_obs = self._env.env._get_observations()
-        pixels = self._format_raw_obs(raw_obs)["pixels"]
-        image = next(iter(pixels.values()))
-        image = image[::-1, ::-1]  # flip both H and W for visualization
-        return image
+        formatted = self._format_raw_obs(raw_obs)
+
+        panels = []
+
+        # 1. Agentview RGB
+        if "image" in formatted["pixels"]:
+            img = formatted["pixels"]["image"]
+            img = img[::-1, ::-1]  # flip H and W
+            panels.append(img)
+
+        # 2. Wrist RGB
+        if "image2" in formatted["pixels"]:
+            img2 = formatted["pixels"]["image2"]
+            img2 = img2[::-1, ::-1]
+            panels.append(img2)
+
+        # 3. Agentview Depth（灰度转 RGB 以便拼接）
+        if "depths" in formatted and "image" in formatted["depths"]:
+            depth = formatted["depths"]["image"]
+            depth = depth[::-1, ::-1]
+            # 归一化到 0-255，转成 3 通道灰度图
+            d_min, d_max = depth.min(), depth.max()
+            if d_max - d_min > 1e-6:
+                depth_norm = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            else:
+                depth_norm = np.zeros_like(depth, dtype=np.uint8)
+            depth_rgb = np.stack([depth_norm] * 3, axis=-1)
+            # resize 到和 RGB 同尺寸（depth 可能尺寸不同）
+            if depth_rgb.shape[:2] != panels[0].shape[:2]:
+                from PIL import Image
+                depth_rgb = np.array(Image.fromarray(depth_rgb).resize(
+                    (panels[0].shape[1], panels[0].shape[0]),
+                    resample=Image.NEAREST,
+                ))
+            panels.append(depth_rgb)
+        # 4. Wrist Depth（灰度转 RGB 以便拼接）
+        if "depths" in formatted and "image2" in formatted["depths"]:
+            depth2 = formatted["depths"]["image2"]
+            depth2 = depth2[::-1, ::-1]
+            d_min, d_max = depth2.min(), depth2.max()
+            if d_max - d_min > 1e-6:
+                depth_norm2 = ((depth2 - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            else:
+                depth_norm2 = np.zeros_like(depth2, dtype=np.uint8)
+            depth_rgb2 = np.stack([depth_norm2] * 3, axis=-1)
+            if depth_rgb2.shape[:2] != panels[0].shape[:2]:
+                from PIL import Image
+                depth_rgb2 = np.array(Image.fromarray(depth_rgb2).resize(
+                    (panels[0].shape[1], panels[0].shape[0]),
+                    resample=Image.NEAREST,
+                ))
+            panels.append(depth_rgb2)
+        # 左右拼接: [agentview | wrist | depth]
+        if len(panels) > 1:
+            return np.concatenate(panels, axis=1)
+        return panels[0]
 
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None, "_format_raw_obs called before _ensure_env()"
         images = {}
+        depths = {}
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
             images[self.camera_name_mapping[camera_name]] = image
+
+            # 提取 depth: "agentview_image" → "agentview_depth"
+            depth_key = camera_name.replace("_image", "_depth")
+            if depth_key in raw_obs:
+                d = raw_obs[depth_key].astype(np.float32).squeeze()  # (raw_H, raw_W)
+                # resize 到和 RGB 同尺寸（depth 用最近邻插值保持值不失真）
+                if d.shape != (self.observation_height, self.observation_width):
+                    from PIL import Image
+                    d = np.array(Image.fromarray(d).resize(
+                        (self.observation_width, self.observation_height),
+                        resample=Image.NEAREST,
+                    ))
+                depths[self.camera_name_mapping[camera_name]] = d
 
         eef_pos = raw_obs.get("robot0_eef_pos")
         eef_quat = raw_obs.get("robot0_eef_quat")
@@ -290,6 +384,7 @@ class LiberoEnv(gym.Env):
         joint_vel = raw_obs.get("robot0_joint_vel")
         obs = {
             "pixels": images,
+            "depths": depths,  # 新增：深度图（不会传给 policy）
             "robot_state": {
                 "eef": {
                     "pos": eef_pos,  # (3,)
@@ -307,7 +402,7 @@ class LiberoEnv(gym.Env):
             },
         }
         if self.obs_type == "pixels":
-            return {"pixels": images.copy()}
+            return {"pixels": images.copy(), "depths": depths.copy()}
 
         if self.obs_type == "pixels_agent_pos":
             # Validate required fields are present
@@ -327,7 +422,9 @@ class LiberoEnv(gym.Env):
     def reset(self, seed=None, **kwargs):
         self._ensure_env()
         super().reset(seed=seed)
-        self._env.seed(seed)
+        #print(seed)
+        if seed is not None:
+            self._env.seed(seed)
         raw_obs = self._env.reset()
         if self.init_states and self._init_states is not None:
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])

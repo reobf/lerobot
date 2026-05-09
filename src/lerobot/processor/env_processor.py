@@ -13,13 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
-
+import os
+from dataclasses import dataclass, field
 import torch
-
+from pathlib import Path
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.utils.constants import OBS_IMAGES, OBS_PREFIX, OBS_STATE, OBS_STR
-
+import numpy as np
 from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
 
@@ -45,12 +45,98 @@ class LiberoProcessorStep(ObservationProcessorStep):
     -   Rotates images by 180 degrees by flipping both height and width dimensions.
     -   This accounts for the HuggingFaceVLA/libero camera orientation convention.
     """
+# depth dump 配置（通过环境变量控制）
+    depth_dump_dir: str = field(default_factory=lambda: os.environ.get("LIBERO_DEPTH_DIR", "./depth_dumps"))
+    depth_dump_enabled: bool = field(default_factory=lambda: os.environ.get("LIBERO_DUMP_DEPTH", "0") == "1")
+    _depth_frame_counter: int = field(default=0, init=False, repr=False)
+    _znear: float = field(default=0.01, init=False, repr=False)
+    _zfar: float = field(default=500.0, init=False, repr=False)
+ 
+    def __post_init__(self):
+        if self.depth_dump_enabled:
+            Path(self.depth_dump_dir).mkdir(parents=True, exist_ok=True)
+            print(f"[DepthDump] Enabled. Saving depth to: {self.depth_dump_dir}")
 
+    def set_depth_params(self, znear, zfar):
+        """从环境获取 near/far 后调用。"""
+        self._znear = znear
+        self._zfar = zfar
+        print(f"[DepthEncoder] znear={znear}, zfar={zfar}")
+
+    def _encode_depth_16bit(self, depth_zbuffer):
+        """z-buffer tensor → 16-bit RGB tensor (和数据集格式一致)。
+
+        输入: (B, 1, H, W) 或 (B, H, W), 值域 [0, 1] z-buffer
+        输出: (B, 3, H, W), R=高8位/255 G=低8位/255 B=0, 值域 [0, 1] float
+        """
+        if depth_zbuffer.ndim == 4:
+            d = depth_zbuffer[:, 0, :, :]
+        else:
+            d = depth_zbuffer
+
+        near, far = self._znear, self._zfar
+        d_real = near / (1.0 - d * (1.0 - near / far))
+
+        d_mm = (d_real * 10000).clamp(0, 65535)
+        d_int = d_mm.to(torch.int32)
+        high = ((d_int >> 8) & 0xFF).float() / 255.0
+        low = (d_int & 0xFF).float() / 255.0
+        zero = torch.zeros_like(high)
+
+        return torch.stack([high, low, zero], dim=1)
+ 
+    def _dump_depths(self, depths: dict):
+        """保存 depth 到磁盘。depths 是 {camera_name: depth_array} 的 dict。"""
+        #print(depths)
+        if not self.depth_dump_enabled:
+            return
+        save_dict = {}
+        for cam_name, depth in depths.items():
+            if isinstance(depth, torch.Tensor):
+                depth = depth.cpu().numpy()
+            save_dict[cam_name] = depth.astype(np.float32)
+        fname = Path(self.depth_dump_dir) / f"frame_{self._depth_frame_counter:06d}.npz"
+        np.savez_compressed(fname, **save_dict)
+        self._depth_frame_counter += 1
     def _process_observation(self, observation):
+    # === Lazy init: 从 env var 读 znear/zfar (由 LIBERO env 在 _ensure_env 中写) ===
+        if not getattr(self, '_depth_params_initialized', False):
+            znear_env = os.environ.get('LIBERO_ZNEAR')
+            zfar_env = os.environ.get('LIBERO_ZFAR')
+            if znear_env and zfar_env:
+                self._znear = float(znear_env)
+                self._zfar = float(zfar_env)
+                print(f"[DepthEncoder] lazy init from env: znear={self._znear}, zfar={self._zfar}")
+            else:
+                print(f"[DepthEncoder] WARN: LIBERO_ZNEAR/ZFAR env var not set, "
+                    f"using fallback znear={self._znear}, zfar={self._zfar} "
+                    f"(可能跟 hdf.py 不一致, 数据会错!)")
+            self._depth_params_initialized = True        
         """
         Processes both image and robot_state observations from LIBERO.
         """
+        #print(f"[DEBUG processor] keys: {list(observation.keys())}")
         processed_obs = observation.copy()
+        depth_key = OBS_PREFIX + "depths"
+        #print(processed_obs)
+        if depth_key in processed_obs:
+            depths = processed_obs[depth_key]
+            self._dump_depths(depths)
+            # 展开成和 images 一样的 key 格式，并做 180° 翻转 + 16-bit 编码
+            # observation.depths → observation.depths.image, observation.depths.image2
+            if isinstance(depths, dict):
+                for cam_name, depth_tensor in depths.items():
+                    full_key = f"{depth_key}.{cam_name}"
+                    if isinstance(depth_tensor, torch.Tensor):
+                        if depth_tensor.ndim == 4:
+                            depth_tensor = torch.flip(depth_tensor, dims=[2, 3])  # (B, C, H, W)
+                        elif depth_tensor.ndim == 3:
+                            depth_tensor = torch.flip(depth_tensor, dims=[1, 2])  # (B, H, W)
+                        # z-buffer → 真实距离 → 16-bit RGB 编码（和数据集一致）
+                        depth_tensor = self._encode_depth_16bit(depth_tensor)
+                    processed_obs[full_key] = depth_tensor
+            del processed_obs[depth_key]  # 删掉原始的 dict 形式，保留展开后的
+
         for key in list(processed_obs.keys()):
             if key.startswith(f"{OBS_IMAGES}."):
                 img = processed_obs[key]

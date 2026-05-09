@@ -75,6 +75,9 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
     """
     # map to expected inputs for the policy
     return_observations = {}
+    #print(observations.keys())
+    if "depths" in observations:
+        return_observations[f"{OBS_STR}.depths"] = _convert_nested_dict(observations["depths"])
     if "pixels" in observations:
         if isinstance(observations["pixels"], dict):
             imgs = {f"{OBS_IMAGES}.{key}": img for key, img in observations["pixels"].items()}

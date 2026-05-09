@@ -147,6 +147,9 @@ class TrainPipelineConfig(HubMixin):
             cli_overrides = parser.get_cli_overrides("policy")
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = Path(policy_path)
+            if self.resume:
+                policy_dir = Path(policy_path)
+                self.checkpoint_path = Path(policy_path).parent
         elif self.resume:
             config_path = parser.parse_arg("config_path")
             if not config_path:

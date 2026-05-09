@@ -182,6 +182,7 @@ def rollout(
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
+        #print(observation.keys())
         with torch.inference_mode():
             action = policy.select_action(observation)
         action = postprocessor(action)
@@ -391,7 +392,7 @@ def eval_policy(
                 done_indices,
                 start_episode_index=batch_ix * env.num_envs,
                 start_data_index=(0 if episode_data is None else (episode_data["index"][-1].item() + 1)),
-                fps=env.unwrapped.metadata["render_fps"],
+                fps=getattr(getattr(env, "unwrapped", env), "metadata", {"render_fps": 10}).get("render_fps", 10),
             )
             if episode_data is None:
                 episode_data = this_episode_data
@@ -419,7 +420,7 @@ def eval_policy(
                     args=(
                         str(video_path),
                         stacked_frames[: done_index + 1],  # + 1 to capture the last observation
-                        env.unwrapped.metadata["render_fps"],
+                        getattr(getattr(env, "unwrapped", env), "metadata", {"render_fps": 10}).get("render_fps", 10),
                     ),
                 )
                 thread.start()

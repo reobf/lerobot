@@ -51,7 +51,8 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 ```
 
 """
-
+from lerobot.policies.smolvla.pcd_encoder import PCDDepthEncoder
+import os
 import math
 from collections import deque
 from typing import TypedDict, Unpack
@@ -72,6 +73,56 @@ from ..utils import (
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
+_DECODE_DEPTH_CALL_COUNT = 0  # global counter for sampled diagnostic
+
+# ============================================================
+# Depth filter ranges (PER CAMERA, in meters)
+# ----------------------------------------------------------------
+# 控制点云有效深度范围. 比 z_min 近 / 比 z_max 远的点视为 invalid:
+#   - 可视化时用红色高亮
+#   - PointNet 反投影时丢点 (如果 PCD encoder 用同样阈值)
+#
+# 索引按 image_features 顺序: 0 = agent (cam0), 1 = wrist (cam1).
+# Note: 你 hdf.py stat.extent=10 没乘进去, 单位被压缩 ~10×.
+#       当前数据: agent z 实际范围 ~[0.04, 0.29],  wrist z ~[0.003, 0.20]
+#
+# 改完后: 可视化立即生效, train/eval 都会用新阈值.
+# 如果以后修复了 stat.extent bug, 这里改成真实米值即可.
+# ============================================================
+Z_RANGES = {
+    # 修了 stat.extent + decode /10000 后, depth 是真实米单位
+    # 根据你 eval 看到的真实值 (decode_depth /10000 修复后):
+    #   agent: 真实 z ~ 0.6-2.9 m  (桌面 ~1.5m)
+    #   wrist: 真实 z ~ 0.04-0.4 m (夹爪贴近物体)
+    0: (0.5, 3.0),       # cam0 = agent: 0.5m 以下=invalid 占位 / 3.0m 以上=远场景
+    1: (0.04, 1.5),      # cam1 = wrist: 4cm 以下=夹爪表面 invalid / 1.5m 以上=outlier
+}
+
+
+def get_z_range(cam_idx: int) -> tuple[float, float]:
+    """Get (z_min, z_max) for a given camera index. Falls back to permissive default."""
+    return Z_RANGES.get(cam_idx, (0.0, 100.0))
+
+
+def decode_depth(depth_map):
+    """16-bit RGB → 真实距离（米）。1 LSB = 0.1mm。
+
+    匹配 hdf.py 和 LiberoProcessorStep 的 ×10000 编码:
+      生成端: d_mm_int = depth_real × 10000  (0.1mm 量化)
+      解码端: depth_real = d_mm_int / 10000
+
+    Max 编码距离 = 65535 / 10000 = 6.5535 m (LIBERO 桌面 ~1.5m, 余量大)
+    """
+    if depth_map.ndim == 4:
+        if depth_map.shape[1] <= 3:  # (B, C, H, W)
+            high = depth_map[:, 0, :, :].float() * 255.0
+            low = depth_map[:, 1, :, :].float() * 255.0
+        else:  # (B, H, W, C)
+            high = depth_map[:, :, :, 0].float() * 255.0
+            low = depth_map[:, :, :, 1].float() * 255.0
+    else:
+        return depth_map.float()
+    return (high * 256 + low) / 10000.0  # 0.1mm → m
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
@@ -168,7 +219,6 @@ def pad_vector(vector, new_dim):
     new_vector[..., :current_dim] = vector
     return new_vector
 
-
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -247,7 +297,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
-
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._queues = {
@@ -286,12 +335,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
+        depths = self.prepare_depths(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, depths=depths, **kwargs
         )
 
         # Unpad actions
@@ -331,7 +381,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
         """
-
+        #print(batch.keys())
+        #exit(0)
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
         )
@@ -373,13 +424,59 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+        depths = self.prepare_depths(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
+
+        # === PCD Evolution print (每 500 forward) ===
+        if (getattr(self.model, "use_pcd", False)
+                and self.model.pcd_encoder_agent is not None):
+            if not hasattr(self, "_pcd_step_count"):
+                self._pcd_step_count = 0
+                self._pcd_last_grads = {}
+                # 3D-CAVLA mimic: 只有 PointNet body + proj, 没有 gate/scale/mod_emb
+                for _name, _mod in [("agent", self.model.pcd_encoder_agent),
+                                    ("wrist", self.model.pcd_encoder_wrist)]:
+                    hook_targets = [
+                        (f"{_name}.proj.w", _mod.proj.weight),
+                        (f"{_name}.pn.conv1.w", _mod.pointnet.conv1.weight),
+                        (f"{_name}.pn.conv3.w", _mod.pointnet.conv3.weight),
+                        (f"{_name}.stn.fc3.w", _mod.pointnet.stn.fc3.weight),
+                    ]
+                    for _key, _p in hook_targets:
+                        def _make_hook(_n):
+                            def _hook(grad):
+                                self._pcd_last_grads[_n] = grad.detach().float().norm().item()
+                                return None
+                            return _hook
+                        _p.register_hook(_make_hook(_key))
+
+            if self._pcd_step_count % 100 == 0:
+                a = self.model.pcd_encoder_agent
+                w = self.model.pcd_encoder_wrist
+                lg = self._pcd_last_grads
+                # 直接看 token magnitude (raw PointNet output 的量级反映场景几何复杂度)
+                with torch.no_grad():
+                    a_proj_w_norm = a.proj.weight.float().norm().item()
+                    w_proj_w_norm = w.proj.weight.float().norm().item()
+                print(
+                    f"[PCD-Evol] step={self._pcd_step_count}  "
+                    f"agent.proj.w_norm={a_proj_w_norm:.3f}  |  "
+                    f"wrist.proj.w_norm={w_proj_w_norm:.3f}"
+                )
+                grad_str = "  ".join(
+                    f"{k}.g={lg.get(k, float('nan')):.4f}"
+                    for k in ("agent.proj.w", "agent.pn.conv1.w", "agent.stn.fc3.w",
+                              "wrist.proj.w", "wrist.pn.conv1.w")
+                )
+                print(f"[PCD-Grad] step={self._pcd_step_count}  {grad_str}")
+            self._pcd_step_count += 1
+
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, depths=depths)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -453,6 +550,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images.append(img)
             img_masks.append(mask)
         return images, img_masks
+
+    def prepare_depths(self, batch):
+        """Extract depth maps from batch, aligned with prepare_images output order.
+
+        Depth key naming convention:
+            observation.images.image  → observation.depths.image
+            observation.images.image2 → observation.depths.image2
+
+        Returns:
+            List of depth tensors (one per camera), or None if no depth in batch.
+        """
+        depths = []
+        has_any = False
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+
+        for key in present_img_keys:
+            depth_key = key.replace("observation.images.", "observation.depths.")
+            if depth_key in batch:
+                depth = batch[depth_key]
+                depth = depth[:, -1, :, :, :] if depth.ndim == 5 else depth
+                depths.append(depth)
+                has_any = True
+            else:
+                depths.append(None)
+
+        return depths if has_any else None
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -593,7 +716,175 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
+        # =================================================================
+        # PCD Depth Branch (baseline E, 3D-CAVLA inspired)
+        # ----------------------------------------------------------------
+        # 通过环境变量 USE_PCD=1 启用. 默认关闭, 行为与原版 SmolVLA 完全一致.
+        # 设计思路 (跟 baseline B/C/D 的对照):
+        #   - B (DeFM prefix): 9 个 image-like depth tokens / cam → 干扰主干 attention
+        #   - C (Ego3D PE):    PE 加在 RGB token 上 → 模型主动抵抗
+        #   - D (Cross-Attn):  cross-attn 选择性查询 depth → K/V 不学 (gate 卡 0)
+        #   - E (PCD/PointNet): 1 个 global geometry token / cam, 显式异质于 RGB
+        #
+        # 假设: 异质性大反而更好学. PointNet feature 跟 SigLIP feature 完全
+        # 不同分布, 模型 unambiguously 识别为新模态.
+        # =================================================================
+        self.use_pcd = os.environ.get("USE_PCD", "0") == "1"
+
+        # ADD_PCD: 是否在 prefix 里给 PCD 留槽位 (默认 1).
+        # - ADD_PCD=1, USE_PCD=1: 每个 image 后面 append 一个真 PCD token (PointNet 算)
+        # - ADD_PCD=1, USE_PCD=0: 每个 image 后面 append 一个 zero 占位 token
+        #   → prefix 长度跟 USE_PCD=1 完全一样, 主干看到的 token 结构对齐,
+        #     消除 "USE_PCD=0 vs USE_PCD=1 prefix 长度不同导致的额外学习成本"
+        # - ADD_PCD=0: 啥都不加, 等价 baseline A 的 prefix
+        self.add_pcd = os.environ.get("ADD_PCD", "1") == "1"
+
+        # 总是创建 PCD encoder (即使 USE_PCD=0) — 保证 ckpt 始终含 PCD 参数,
+        # USE_PCD=0 → USE_PCD=1 resume 时不会 "List length mismatch".
+        # 当 USE_PCD=0 时, encoder 创建但 freeze + 不参与 forward.
+        vla_hidden = self.vlm_with_expert.config.text_config.hidden_size
+        self.pcd_encoder_agent = PCDDepthEncoder(
+            vla_hidden=vla_hidden,
+            fovy_deg=45.0,             # LIBERO agent view
+            img_size=512,
+            num_points=4096,
+            cam_label="agent",
+        )
+        self.pcd_encoder_wrist = PCDDepthEncoder(
+            vla_hidden=vla_hidden,
+            fovy_deg=75.0,             # LIBERO wrist view
+            img_size=512,
+            num_points=4096,
+            cam_label="wrist",
+        )
+
+        # =================================================================
+        # Placeholder + Modality embeddings
+        # ----------------------------------------------------------------
+        # 1) PCD placeholder (learnable, per-camera):
+        #    USE_PCD=0 时塞这个代替 zero token, 避免 zero 毒化主干 attention.
+        #    每个相机一个独立 placeholder, 让主干能学到 "agent slot empty" vs
+        #    "wrist slot empty" 的区分.
+        #
+        # 2) Modality embeddings (learnable):
+        #    给 RGB / PCD / lang token 各加一个可学 embedding, 让主干第一层
+        #    就能识别 token 模态. ViT/Flamingo/CLIP 标准做法.
+        #    init scale = 0.02 跟 BERT/GPT embedding init 一致, 不破坏 token
+        #    量级 (现有 RGB / PCD / lang token std≈1).
+        #
+        # 控制开关 (默认全开):
+        #   PCD_LEARNABLE_PLACEHOLDER=1: USE_PCD=0 时用 learnable placeholder
+        #   USE_MODALITY_EMB=1:           给 RGB/PCD/lang 加 modality_emb
+        # =================================================================
+        self.use_learnable_placeholder = (
+            os.environ.get("PCD_LEARNABLE_PLACEHOLDER", "1") == "1"
+        )
+        self.use_modality_emb = os.environ.get("USE_MODALITY_EMB", "1") == "1"
+
+        # PCD placeholders — 只在 ADD_PCD=1 + 用 learnable placeholder 时有意义.
+        # 但永远创建 (即使 USE_PCD=1 时), 保证 ckpt 结构一致, USE_PCD=0↔1 resume
+        # 不报 missing key.
+        self.pcd_placeholder_agent = nn.Parameter(
+            torch.randn(1, 1, vla_hidden) * 0.02
+        )
+        self.pcd_placeholder_wrist = nn.Parameter(
+            torch.randn(1, 1, vla_hidden) * 0.02
+        )
+
+        # Modality embeddings — 同样永远创建保证 ckpt 一致.
+        # state 不加 modality_emb, 它本来 1 个 token 位置先验已够强.
+        self.modality_emb_rgb = nn.Parameter(torch.randn(1, 1, vla_hidden) * 0.02)
+        self.modality_emb_pcd = nn.Parameter(torch.randn(1, 1, vla_hidden) * 0.02)
+        self.modality_emb_lang = nn.Parameter(torch.randn(1, 1, vla_hidden) * 0.02)
+
+        # 如果 placeholder/modality_emb 关闭, freeze 对应参数 (不参与训练,
+        # 但仍 save 到 ckpt — 后续切换不会 missing key).
+        if not self.use_learnable_placeholder:
+            self.pcd_placeholder_agent.requires_grad = False
+            self.pcd_placeholder_wrist.requires_grad = False
+        if not self.use_modality_emb:
+            self.modality_emb_rgb.requires_grad = False
+            self.modality_emb_pcd.requires_grad = False
+            self.modality_emb_lang.requires_grad = False
+
+        print(
+            f"[Modality] use_learnable_placeholder={int(self.use_learnable_placeholder)}, "
+            f"use_modality_emb={int(self.use_modality_emb)}. "
+            f"Extra trainable params: "
+            f"placeholder={2 * vla_hidden if self.use_learnable_placeholder else 0:,}, "
+            f"modality_emb={3 * vla_hidden if self.use_modality_emb else 0:,}"
+        )
+
+        if self.use_pcd:
+            print(
+                f"[PCD] Baseline E (3D-CAVLA mimic) ENABLED. ADD_PCD={int(self.add_pcd)}. "
+                f"PointNet → Linear(1024, {vla_hidden}) → 1 token / cam, no gate/scale/mod_emb. "
+                f"agent: {self.pcd_encoder_agent.num_trainable_params():,} params, "
+                f"wrist: {self.pcd_encoder_wrist.num_trainable_params():,} params"
+            )
+            self._pcd_check_done = False
+        else:
+            if self.add_pcd:
+                print(
+                    f"[PCD] USE_PCD=0, ADD_PCD=1 → injecting ZERO placeholder token after each image. "
+                    f"PCD encoders FROZEN (kept in ckpt for forward-compat with USE_PCD=1 resume)."
+                )
+            else:
+                print(
+                    f"[PCD] USE_PCD=0, ADD_PCD=0 → no PCD slot in prefix (= baseline A). "
+                    f"PCD encoders FROZEN (kept in ckpt for forward-compat with USE_PCD=1 resume)."
+                )
+            for p in self.pcd_encoder_agent.parameters():
+                p.requires_grad = False
+            for p in self.pcd_encoder_wrist.parameters():
+                p.requires_grad = False
+            self._pcd_check_done = True
+
         self.set_requires_grad()
+
+        # PCD diagnostic — set_requires_grad 之后检查
+        if self.use_pcd:
+            print("=" * 70)
+            print("[PCD-DIAG] Trainable params after set_requires_grad():")
+            for name, mod in [
+                ("pcd_encoder_agent", self.pcd_encoder_agent),
+                ("pcd_encoder_wrist", self.pcd_encoder_wrist),
+            ]:
+                n_train = mod.num_trainable_params()
+                proj_rg = mod.proj.weight.requires_grad
+                print(f"  {name}: trainable={n_train:,}, "
+                      f"proj.requires_grad={proj_rg}")
+            print("=" * 70)
+
+        # =================================================================
+        # Frozen-state diagnostic (always run, baseline E or not)
+        # ----------------------------------------------------------------
+        # SmolVLA default config: freeze_vision_encoder=True, train_expert_only=True
+        # 等价于 3D-CAVLA 的 "LoRA frozen backbone + train action head" setup
+        # 启动时确认参数 frozen 状态, 便于 debug.
+        # =================================================================
+        print("=" * 70)
+        print("[FREEZE-DIAG] Top-level module trainable param breakdown:")
+        print(f"  config.freeze_vision_encoder = {self.config.freeze_vision_encoder}")
+        print(f"  config.train_expert_only     = {self.config.train_expert_only}")
+        print(f"  config.train_state_proj      = {self.config.train_state_proj}")
+
+        total_train = 0
+        total_all = 0
+        for child_name, child_module in self.named_children():
+            train_p = sum(p.numel() for p in child_module.parameters() if p.requires_grad)
+            all_p = sum(p.numel() for p in child_module.parameters())
+            total_train += train_p
+            total_all += all_p
+            if all_p > 0:
+                pct = 100.0 * train_p / all_p
+                print(f"  {child_name}: {train_p:,} / {all_p:,} trainable ({pct:.1f}%)")
+
+        if total_all > 0:
+            overall_pct = 100.0 * total_train / total_all
+            print(f"  ----------------------------------")
+            print(f"  TOTAL: {total_train:,} / {total_all:,} trainable ({overall_pct:.1f}%)")
+        print("=" * 70)
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
         self.global_image_start_token = torch.tensor(
@@ -635,11 +926,15 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None, depths=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         """
+        # 在 embed_prefix 开头
+        if depths is not None:
+            depths = [decode_depth(d) if d is not None else None for d in depths]
+        #merge_type = int(os.environ.get("MERGE_TYPE", "0"))
         embs = []
         pad_masks = []
         att_masks = []
@@ -647,6 +942,121 @@ class VLAFlowMatching(nn.Module):
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
+            if not hasattr(self, f"_dbg_cam_{_img_idx}"):
+                from torchvision.utils import save_image
+                save_image(
+                    img[0] * 0.5 + 0.5,  # SmolVLM 输入归一化到 [-1,1]，反归一化回 [0,1]
+                    f"/tmp/cam_idx{_img_idx}.png"
+                )
+                print(f"[CAM] idx={_img_idx} saved to /tmp/cam_idx{_img_idx}.png")
+                setattr(self, f"_dbg_cam_{_img_idx}", True)      
+                
+                if False and depths is not None and depths[_img_idx] is not None:
+                    d_raw = depths[_img_idx][0].float()  # 第一个样本，可能是 (3,H,W) 或 (H,W)
+        
+                    # 判断是否已解码：如果是 3 通道就还是 RG16 编码，需要解码
+                    if d_raw.ndim == 3 and d_raw.shape[0] == 3:
+                        exit(0)
+                    elif d_raw.ndim == 3 and d_raw.shape[0] == 1:
+                        d_m = d_raw[0]  # (H, W)
+                    else:
+                        d_m = d_raw  # already (H, W)
+        
+                    print(f"[CAM] idx={_img_idx} depth(m): "
+                        f"min={d_m.min():.3f} max={d_m.max():.3f} "
+                        f"median={d_m.median():.3f} mean={d_m.mean():.3f}")
+        
+                    # 可视化：min-max 归一化，近物体亮、远物体暗
+                    d_vis = 1.0 - (d_m - d_m.min()) / (d_m.max() - d_m.min() + 1e-8)
+                    save_image(d_vis.unsqueeze(0), f"/tmp/depth_idx{_img_idx}.png")
+
+                if depths is not None and depths[_img_idx] is not None:
+                    d_raw = depths[_img_idx][0].float()  # (H, W) 已解码，米
+                    
+                    if d_raw.ndim == 3 and d_raw.shape[0] == 3:
+                        exit(0)
+                    elif d_raw.ndim == 3 and d_raw.shape[0] == 1:
+                        d_m = d_raw[0]
+                    else:
+                        d_m = d_raw
+
+                    print(f"[CAM] idx={_img_idx} depth(m): "
+                        f"min={d_m.min():.3f} max={d_m.max():.3f} "
+                        f"median={d_m.median():.3f} mean={d_m.mean():.3f}")
+
+                    # === Vis 1: 标准灰度深度图 (近=亮 远=暗) ===
+                    d_vis = 1.0 - (d_m - d_m.min()) / (d_m.max() - d_m.min() + 1e-8)
+                    save_image(d_vis.unsqueeze(0), f"/tmp/depth_idx{_img_idx}.png")
+
+                    # === Vis 2: 剔除高亮版本 — invalid 像素染红 ===
+                    # 拿到这个相机的 z 阈值
+                    z_min, z_max = get_z_range(_img_idx)
+                    H, W = d_m.shape
+                    invalid_mask = (d_m < z_min) | (d_m > z_max)  # (H, W) bool
+                    n_invalid = invalid_mask.sum().item()
+                    pct_invalid = 100.0 * n_invalid / (H * W)
+                    print(f"[CAM] idx={_img_idx} filter z∈[{z_min:.3f}, {z_max:.3f}] → "
+                        f"invalid {n_invalid}/{H*W} ({pct_invalid:.1f}%)")
+
+                    # 构造 RGB: 默认灰度 (从 d_vis 复制 3 通道), invalid 染红
+                    rgb_filtered = d_vis.unsqueeze(0).repeat(3, 1, 1).clone()  # (3, H, W) [0,1]
+                    rgb_filtered[0][invalid_mask] = 1.0  # R = 1
+                    rgb_filtered[1][invalid_mask] = 0.0  # G = 0
+                    rgb_filtered[2][invalid_mask] = 0.0  # B = 0
+                    save_image(rgb_filtered, f"/tmp/depth_idx{_img_idx}_filtered.png")
+                    print(f"[CAM] idx={_img_idx} filtered vis saved to "
+                        f"/tmp/depth_idx{_img_idx}_filtered.png "
+                        f"(red = z<{z_min:.3f} or z>{z_max:.3f})")
+
+                    # === 3D 点云 PNG ===
+                    import matplotlib
+                    matplotlib.use('TkAgg')
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    rgb_img = (img[0] * 0.5 + 0.5).clamp(0, 1).cpu()  # (3, H, W) → [0, 1]
+                    depth_np = d_m.cpu().numpy()       # (H, W) 米
+                    rgb_img = (img[0] * 0.5 + 0.5).clamp(0, 1).cpu()  # (3, 512, 512)
+                    depth_np = d_m.cpu().numpy()       # (256, 256)
+                    
+                    # RGB resize 到 depth 尺寸
+                    H, W = depth_np.shape
+                    rgb_resized = torch.nn.functional.interpolate(
+                        rgb_img.unsqueeze(0), size=(H, W), mode='bilinear'
+                    ).squeeze(0)
+                    rgb_np = rgb_resized.permute(1, 2, 0).numpy()  # (256, 256, 3)
+
+                    H, W = depth_np.shape
+                    fovy = 45.0 if _img_idx == 0 else 75.0  # agentview=45, wrist=75
+                    fovy_rad = np.radians(fovy)
+                    fy = H / (2 * np.tan(fovy_rad / 2))
+                    fx = fy
+                    cx, cy = W / 2, H / 2
+
+                    u, v = np.meshgrid(np.arange(W), np.arange(H))
+                    # 用 Z_RANGES 配置过滤点云 (跟 vis 红色区域对应)
+                    valid = (depth_np > z_min) & (depth_np < z_max)
+
+                    z = depth_np[valid]
+                    x = (u[valid] - cx) * z / fx
+                    y = (v[valid] - cy) * z / fy
+                    c = rgb_np[valid]
+
+                    # 降采样（太多点画不动）
+                    step = max(1, len(z) // 500000)
+                    x, y, z, c = x[::step], y[::step], z[::step], c[::step]
+
+                    fig = plt.figure(figsize=(10, 8))
+                    ax = fig.add_subplot(111, projection='3d')
+                    ax.scatter(x, z, -y, c=c, s=1, marker='.')
+                    ax.set_xlabel('X (m)')
+                    ax.set_ylabel('Z / Depth (m)')
+                    ax.set_zlabel('-Y (m)')
+                    ax.set_title(f'cam{_img_idx} pointcloud (near/far from env)')
+                    #plt.show()
+                    fig.savefig(f'/tmp/pointcloud_idx{_img_idx}.png', dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+                    print(f"[CAM] idx={_img_idx} pointcloud saved to /tmp/pointcloud_idx{_img_idx}.png")
+                setattr(self, f"_dbg_cam_{_img_idx}", True)
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -662,12 +1072,73 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+            # 标准 SigLIP → connector → 64 image tokens
+            img_emb = self.vlm_with_expert.embed_image(img)          # (B, 64, 960)
+
+            # ============================================================
+            # RGB Token Compression (env var 控制, 默认开)
+            # ----------------------------------------------------------------
+            # RGB_COMPRESS=N (perfect square 4/9/16/25/36/49) → 用 adaptive
+            #   avg pool 把 8×8=64 token 压缩成 √N × √N = N 个 token.
+            # 默认 RGB_COMPRESS=9 (8×8 → 3×3, 节省 86% prefix 长度).
+            # 设 RGB_COMPRESS=0 关闭压缩 (用 vanilla 64 token, 跟 SmolVLA 论文一致).
+            # 设 RGB_COMPRESS=64 也等价不压缩 (8×8 → 8×8, no-op).
+            #
+            # Why pool (not learn): connector 已经把 raw 特征压缩好了, 我们
+            #   再压一次只用 average pool 不引入新参数, 也不破坏 SmolVLA 预训练.
+            # Why default 9: 9 token 让 batch size 能拉到 80+ (比 64 token 的
+            #   bs=20 有 4× 余量), 适合做 PCD ablation 跑得快. SmolVLA 论文
+            #   也有早期实验用 4-9 token 做 token-efficient 配置.
+            # ============================================================
+            try:
+                rgb_compress = int(os.environ.get("RGB_COMPRESS", "9"))
+            except ValueError:
+                rgb_compress = 9
+            if rgb_compress > 0:
+                B_rgb, N_rgb, D_rgb = img_emb.shape  # 期望 N_rgb=64
+                # 输入必须是 perfect square (8×8=64)
+                src_grid = int(N_rgb ** 0.5)
+                tgt_grid = int(rgb_compress ** 0.5)
+                if (src_grid * src_grid == N_rgb
+                        and tgt_grid * tgt_grid == rgb_compress
+                        and tgt_grid <= src_grid):
+                    # (B, N, D) → (B, D, src_grid, src_grid) → pool → (B, D, tgt, tgt) → (B, tgt², D)
+                    img_emb_grid = img_emb.transpose(1, 2).reshape(B_rgb, D_rgb, src_grid, src_grid)
+                    img_emb_grid = F.adaptive_avg_pool2d(img_emb_grid, (tgt_grid, tgt_grid))
+                    img_emb = img_emb_grid.reshape(B_rgb, D_rgb, rgb_compress).transpose(1, 2)
+
+                    # ---- Magnitude compensation ----
+                    # Avg pool 在 src/tgt 比例下让 std 下降 √(src/tgt) 倍.
+                    # 不补偿的话, RGB token 在主干 attention 里 magnitude 会变弱,
+                    # 影响 fair comparison vs baseline A.
+                    # 补偿系数 = √(每个 target cell 平均的 source 像素数)
+                    pool_factor = (src_grid / tgt_grid)
+                    img_emb = img_emb * pool_factor
+
+                    if not getattr(self, "_rgb_compress_logged", False):
+                        print(
+                            f"[RGB-Compress] enabled: {N_rgb} tokens → {rgb_compress} tokens "
+                            f"({src_grid}×{src_grid} → {tgt_grid}×{tgt_grid} adaptive_avg_pool2d, "
+                            f"magnitude × {pool_factor:.2f} compensation)"
+                        )
+                        self._rgb_compress_logged = True
+                else:
+                    if not getattr(self, "_rgb_compress_warned", False):
+                        print(
+                            f"[RGB-Compress] WARN: invalid config "
+                            f"(N_rgb={N_rgb}, rgb_compress={rgb_compress}). "
+                            f"src_grid={src_grid}, tgt_grid={tgt_grid}. Falling back to no compression."
+                        )
+                        self._rgb_compress_warned = True
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+            # Modality embedding: tag this token group as RGB modality.
+            # Broadcast (1, 1, D) → (B, num_img_embs, D), 不影响其他 dim.
+            if self.use_modality_emb:
+                img_emb = img_emb + self.modality_emb_rgb.to(img_emb.dtype)
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
@@ -690,10 +1161,119 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+
+            # ===================================================================
+            # PCD token injection (per camera, paired with RGB)
+            # ----------------------------------------------------------------
+            # 在每个 image 的 RGB tokens (+ optional image_end_token) 之后插入
+            # 一个 PCD token, 对应同一个相机的 depth. 这样空间语义对齐:
+            #   [agent_RGB(64) | agent_PCD(1) | wrist_RGB(64) | wrist_PCD(1) | lang ...]
+            #
+            # ADD_PCD=0:                  跳过, 不加
+            # ADD_PCD=1, USE_PCD=0:       加 placeholder token
+            #   - PCD_LEARNABLE_PLACEHOLDER=1 (默认): 加 learnable per-cam placeholder
+            #   - PCD_LEARNABLE_PLACEHOLDER=0:        加 zero 占位 (legacy, 主干被毒化)
+            # ADD_PCD=1, USE_PCD=1:       加真 PCD token (PointNet 算)
+            #
+            # 修复 (vs 上版本):
+            #   1) 用 learnable placeholder 代替 zero — zero token 会让 attention
+            #      budget 被无效消耗, 主干 RGB 间 attention 被稀释, 是个隐性 bug.
+            #      learnable placeholder 让主干能学到 "这个槽位是空的" 的语义,
+            #      不破坏其他 token 间的 attention 强度.
+            #   2) PCD token 加 sqrt(d) magnitude alignment (跟 RGB / lang 一致),
+            #      加 modality_emb_pcd 让主干第一层就能识别这是 PCD 模态.
+            # ===================================================================
+            if self.add_pcd:
+                B_cam = img.shape[0]
+                vla_hidden = self.vlm_with_expert.config.text_config.hidden_size
+                target_dtype = embs[-1].dtype
+                target_device = embs[-1].device
+
+                is_real_pcd = (
+                    self.use_pcd
+                    and depths is not None
+                    and _img_idx < len(depths)
+                    and depths[_img_idx] is not None
+                )
+
+                if is_real_pcd:
+                    d = depths[_img_idx]
+                    if d.ndim == 4 and d.shape[1] == 1:
+                        d = d.squeeze(1)
+                    encoder = self.pcd_encoder_agent if _img_idx == 0 else self.pcd_encoder_wrist
+                    pcd_token = encoder(d, target_dtype=target_dtype)  # (B, 1, vla_hidden)
+
+                    # Magnitude alignment: 跟 RGB / lang 一样乘 sqrt(d).
+                    # PointNet → Linear 输出 std 大约是 1, sqrt(960)≈31 后跟 RGB 一致.
+                    pcd_token = pcd_token * torch.tensor(
+                        vla_hidden**0.5, dtype=pcd_token.dtype, device=pcd_token.device
+                    )
+                else:
+                    if self.use_learnable_placeholder:
+                        # Learnable placeholder, broadcast 到 batch
+                        ph = (
+                            self.pcd_placeholder_agent
+                            if _img_idx == 0
+                            else self.pcd_placeholder_wrist
+                        )
+                        # Magnitude alignment (跟 real PCD 保持一致)
+                        ph = ph * torch.tensor(
+                            vla_hidden**0.5, dtype=ph.dtype, device=ph.device
+                        )
+                        pcd_token = ph.expand(B_cam, -1, -1).to(
+                            dtype=target_dtype, device=target_device
+                        )
+                    else:
+                        # Legacy: zero token (有毒化 attention 的隐性 bug)
+                        pcd_token = torch.zeros(
+                            B_cam, 1, vla_hidden, dtype=target_dtype, device=target_device
+                        )
+
+                # Modality embedding: tag this token as PCD modality.
+                # 即使 placeholder 也加 (placeholder 自己已经能学 modality info,
+                # 但加上 modality_emb 让 RGB / PCD / lang 三路用同一套 modality
+                # 编码方案, 主干学起来更一致).
+                if self.use_modality_emb:
+                    pcd_token = pcd_token + self.modality_emb_pcd.to(pcd_token.dtype)
+
+                pcd_mask = torch.ones(B_cam, 1, dtype=torch.bool, device=target_device)
+
+                # 记录 PCD token 在 prefix 中的精确索引 (用于 attention probe)
+                # 此时 sum([e.shape[1] for e in embs]) 就是 PCD token 即将被插入的位置
+                pcd_token_idx = sum(e.shape[1] for e in embs)
+                if not hasattr(self, "_last_pcd_indices"):
+                    self._last_pcd_indices = []
+                if _img_idx == 0:
+                    self._last_pcd_indices = []  # 重置 (每次 forward 都重新填)
+                self._last_pcd_indices.append(pcd_token_idx)
+
+                embs.append(pcd_token)
+                pad_masks.append(pcd_mask)
+                att_masks += [0] * 1
+
+                if not self._pcd_check_done and _img_idx == 0:
+                    if is_real_pcd:
+                        kind = "REAL PointNet"
+                    elif self.use_learnable_placeholder:
+                        kind = "LEARNABLE placeholder"
+                    else:
+                        kind = "ZERO placeholder (legacy)"
+                    print(
+                        f"[PCD] First-forward inject: 1 {kind} token after each RGB. "
+                        f"(use_pcd={int(self.use_pcd)}, add_pcd={int(self.add_pcd)}, "
+                        f"learnable_placeholder={int(self.use_learnable_placeholder)}, "
+                        f"modality_emb={int(self.use_modality_emb)})"
+                    )
+                    self._pcd_check_done = True
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+
+        # Modality embedding: tag this token group as language modality.
+        if self.use_modality_emb:
+            lang_emb = lang_emb + self.modality_emb_lang.to(lang_emb.dtype)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -703,6 +1283,8 @@ class VLAFlowMatching(nn.Module):
 
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        state_emb_dim = state_emb.shape[-1]
+        state_emb = state_emb * (state_emb_dim ** 0.5)
         embs.append(state_emb)
         bsize = state_emb.shape[0]
         device = state_emb.device
@@ -772,7 +1354,7 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, depths=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -780,12 +1362,11 @@ class VLAFlowMatching(nn.Module):
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
-
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, depths=depths
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -794,6 +1375,29 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        # ============================================================
+        # ATTENTION PROBE: 测主干每层 attention 对 PCD token 的 attention weight
+        # ----------------------------------------------------------------
+        # ATTN_PROBE_FREQ 环境变量控制采样频率 (默认 200 = 每 200 forward 探测一次).
+        # 设 0 关闭. 探测时 attention probs 被 detach 缓存到 vlm_with_expert,
+        # 不进梯度图, 但占额外显存 (B × num_layers × num_heads × seq² × 4 bytes).
+        # ============================================================
+        probe_attn_now = False
+        try:
+            probe_freq = int(os.environ.get("ATTN_PROBE_FREQ", "2000"))
+        except ValueError:
+            probe_freq = 0
+        if probe_freq > 0 and self.add_pcd:
+            if not hasattr(self, "_attn_probe_count"):
+                self._attn_probe_count = 0
+            self._attn_probe_count += 1
+            probe_attn_now = (self._attn_probe_count % probe_freq == 0)
+        if probe_attn_now:
+            self.vlm_with_expert._probe_attn = True
+            self.vlm_with_expert._probe_attn_buf = []
+        # ============================================================
+
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
@@ -802,12 +1406,164 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+
+        # ============================================================
+        # ATTENTION PROBE: 分析缓存的 probs, print 每层对 PCD 列的关注度
+        # ----------------------------------------------------------------
+        # probs shape per layer: (B, num_heads, total_seq, total_seq)
+        # PCD 列在 prefix 中的位置由 self._last_pcd_indices 给出.
+        # 我们看 EXPERT (action expert) query → PCD key 的 attention,
+        # 因为这才是"主干在生成 action 时多看 PCD 的程度".
+        # ============================================================
+        if probe_attn_now and hasattr(self.vlm_with_expert, "_probe_attn_buf"):
+            self._analyze_pcd_attn(
+                self.vlm_with_expert._probe_attn_buf,
+                prefix_embs.shape[1],
+                suffix_embs.shape[1],
+            )
+            # 清理: 关探针, 释放 buf, 避免下次默认 forward 还在缓存
+            self.vlm_with_expert._probe_attn = False
+            self.vlm_with_expert._probe_attn_buf = []
+        # ============================================================
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
+
+    def _analyze_pcd_attn(self, probs_list, prefix_len, suffix_len):
+        """
+        分析 attention probs, print 每层对 PCD 列的关注度.
+
+        probs_list: list of (B, num_heads, seq, seq), 一个 layer 一个 tensor.
+                    注意 seq 可能 < prefix_len + suffix_len (forward_attn_layer
+                    在 fill_kv_cache=False 模式下可能切短).
+        prefix_len: prefix 长度 (含 RGB / image_end / PCD / lang / state)
+        suffix_len: suffix 长度 (action expert tokens, chunk_size 个)
+        """
+        if not probs_list or not getattr(self, "_last_pcd_indices", None):
+            return
+
+        pcd_indices = self._last_pcd_indices
+        suffix_start = prefix_len  # expert query 起始位置 (理想情况)
+
+        # ---- 一次性 sanity check: 跳过形状不符或 PCD 越界的层 ----
+        # probs[k] 第三/第四维可能比 prefix_len 还小 (early layer w/ truncated mask).
+        # 也可能比 prefix_len+suffix_len 大 (kv cache 累积).
+        # 我们要求最小 shape 是 max(pcd_indices)+1, 否则跳过该层.
+        max_pcd_idx = max(pcd_indices)
+
+        non_pcd_prefix_rows_full = [
+            i for i in range(prefix_len) if i not in pcd_indices
+        ]
+        # 转成 GPU tensor 一次, 后面切片用
+        # (用 list 当 indexer PyTorch 会每次重建 tensor, 慢且可能引发奇怪 device 问题)
+
+        uniform = 1.0 / prefix_len
+        print(f"[AttnProbe] PCD indices in prefix: {pcd_indices} "
+              f"(prefix_len={prefix_len}, suffix_len={suffix_len}, uniform={uniform:.5f})")
+
+        for layer_idx, probs in enumerate(probs_list):
+            seq_len_k = probs.shape[-1]   # key 维度
+            seq_len_q = probs.shape[-2]   # query 维度
+
+            # 跳过 PCD column 越界
+            if seq_len_k <= max_pcd_idx:
+                print(f"[AttnProbe] L{layer_idx}: SKIP "
+                      f"(seq_len_k={seq_len_k} <= max_pcd_idx={max_pcd_idx})")
+                continue
+
+            # 限定 prefix rows 在合法范围内
+            non_pcd_rows_safe = [
+                i for i in non_pcd_prefix_rows_full if i < seq_len_q
+            ]
+
+            # 1) Expert query → PCD key
+            #    expert 行可能在 probs 里完全不存在 (seq_len_q <= prefix_len, 比如
+            #    fill_kv_cache=True path), 也可能存在.
+            if seq_len_q > suffix_start:
+                expert_q_end = min(suffix_start + suffix_len, seq_len_q)
+                expert_block = probs[:, :, suffix_start:expert_q_end, :][
+                    :, :, :, pcd_indices
+                ]
+                # NaN-safe: 用 nanmean 而不是 mean (causal mask 早期行可能全 0/NaN)
+                expert_to_pcd = torch.nanmean(expert_block.float())
+            else:
+                expert_to_pcd = torch.tensor(float("nan"))
+
+            # 2) Prefix query → PCD key
+            if non_pcd_rows_safe:
+                prefix_block = probs[:, :, non_pcd_rows_safe, :][
+                    :, :, :, pcd_indices
+                ]
+                prefix_to_pcd = torch.nanmean(prefix_block.float())
+            else:
+                prefix_to_pcd = torch.tensor(float("nan"))
+
+            e_val = expert_to_pcd.item()
+            p_val = prefix_to_pcd.item()
+            e_str = (
+                f"expert→PCD={e_val:.5f} ({e_val / uniform:.2f}× uniform)"
+                if e_val == e_val   # not NaN
+                else "expert→PCD=N/A (no expert rows in this layer)"
+            )
+            p_str = (
+                f"prefix→PCD={p_val:.5f} ({p_val / uniform:.2f}× uniform)"
+                if p_val == p_val
+                else "prefix→PCD=N/A"
+            )
+            print(f"[AttnProbe] L{layer_idx}: {e_str}  {p_str}")
+
+        # ============================================================
+        # Modality embedding health check (跟 attention probe 一起触发)
+        # ----------------------------------------------------------------
+        # 检查三个 modality_emb 是否互相分离 (cos similarity 接近 0).
+        # 如果都接近 1.0 (正相关) 或 -1.0 (负相关), 说明它们在 latent
+        # space 几乎重合, 主干没法区分模态.
+        # 健康范围: cos sim 在 [-0.5, 0.5] 之间, magnitude 0.05-1.0
+        # 警告范围: cos sim > 0.8 (太相似) or magnitude < 0.01 (太弱)
+        # ============================================================
+        if getattr(self, "use_modality_emb", False):
+            with torch.no_grad():
+                e_rgb = self.modality_emb_rgb.flatten().float()
+                e_pcd = self.modality_emb_pcd.flatten().float()
+                e_lang = self.modality_emb_lang.flatten().float()
+
+                norms = {
+                    "rgb": e_rgb.norm().item(),
+                    "pcd": e_pcd.norm().item(),
+                    "lang": e_lang.norm().item(),
+                }
+                # cos sim 用 normalize + dot
+                def cos(a, b):
+                    return (a / (a.norm() + 1e-8)).dot(b / (b.norm() + 1e-8)).item()
+
+                cos_rp = cos(e_rgb, e_pcd)
+                cos_rl = cos(e_rgb, e_lang)
+                cos_pl = cos(e_pcd, e_lang)
+
+            print(
+                f"[ModEmb] norms: rgb={norms['rgb']:.4f}, pcd={norms['pcd']:.4f}, "
+                f"lang={norms['lang']:.4f}"
+            )
+            print(
+                f"[ModEmb] cos similarities: rgb-pcd={cos_rp:+.4f}, "
+                f"rgb-lang={cos_rl:+.4f}, pcd-lang={cos_pl:+.4f}"
+            )
+            # 自动健康提示
+            warns = []
+            for name, n in norms.items():
+                if n < 0.01:
+                    warns.append(f"||{name}||={n:.4f} too small")
+            for label, cs in [("rgb-pcd", cos_rp), ("rgb-lang", cos_rl), ("pcd-lang", cos_pl)]:
+                if abs(cs) > 0.8:
+                    warns.append(f"{label} cos={cs:+.2f} too aligned")
+            if warns:
+                print(f"[ModEmb] ⚠️ WARN: {'; '.join(warns)}")
+            else:
+                print(f"[ModEmb] ✓ healthy separation")
 
     def sample_actions(
         self,
@@ -817,6 +1573,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        depths=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -828,7 +1585,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, depths=depths
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

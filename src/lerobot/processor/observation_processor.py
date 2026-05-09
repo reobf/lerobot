@@ -95,7 +95,7 @@ class VanillaObservationProcessorStep(ObservationProcessorStep):
         """
         Processes both image and state observations.
         """
-
+        #print(f"[DEBUG] observation_processor received keys: {list(observation.keys())}")
         processed_obs = observation.copy()
 
         if "pixels" in processed_obs:
