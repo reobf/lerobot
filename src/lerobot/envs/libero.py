@@ -272,7 +272,7 @@ class LiberoEnv(gym.Env):
         its own clean EGL context rather than inheriting a stale one from the
         parent process (which causes EGL_BAD_CONTEXT crashes with AsyncVectorEnv).
         """
-        if self._env is not None and hasattr(self._env, 'env') and self._env.env is not None:
+        if self._env is not None:
             return
         print(f"[DEBUG] Rebuilding env (self._env={self._env is not None})")
         env = OffScreenRenderEnv(

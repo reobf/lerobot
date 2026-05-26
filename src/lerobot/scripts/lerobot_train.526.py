@@ -154,17 +154,6 @@ def update_policy(
                     for p in enc.parameters():
                         if p.requires_grad:
                             pcd_param_ids.add(id(p))
-                # PCD_VLMOUT=1 模式: 标量(固定不算) + 瓶颈 MLP 算 PCD energy
-                for _attr in ["pcd_vlmout_scale_agent", "pcd_vlmout_scale_wrist"]:
-                    _p = getattr(inner_model, _attr, None)
-                    if _p is not None and hasattr(_p, "requires_grad") and _p.requires_grad:
-                        pcd_param_ids.add(id(_p))
-                for _attr in ["pcd_vlmout_mlp_agent", "pcd_vlmout_mlp_wrist"]:
-                    _mod = getattr(inner_model, _attr, None)
-                    if _mod is not None:
-                        for p in _mod.parameters():
-                            if p.requires_grad:
-                                pcd_param_ids.add(id(p))
 
             pcd_norm_sq = 0.0
             other_norm_sq = 0.0

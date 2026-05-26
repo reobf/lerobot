@@ -398,52 +398,6 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
-            # ===================================================================
-            # PCD_VLMOUT: PCD token (B, n_pcd, vla_hidden=960) 作为额外 key/value 拼进
-            # expert cross-attn. PCD 走跟 prefix key 完全相同的两段投影:
-            #   PCD (960) → VLM k_proj (model_layers[0]) → (B,n_pcd,kv_heads,head_dim)
-            #            → reshape → expert k_proj → expert key dim
-            # 这样维度跟 expert_key_states 一致, 可拼接. training/inference 都过这里
-            # (不依赖 kv cache), 每次重算. PCD 不加 RoPE (几何 condition).
-            # ===================================================================
-            pcd_kv = getattr(self, "_pcd_kv_token", None)
-            if pcd_kv is not None and expert_key_states is not None:
-                vlm_layer = model_layers[0][layer_idx]
-                _pcd = pcd_kv.to(dtype=vlm_layer.self_attn.k_proj.weight.dtype)
-                # 第一段: VLM k_proj/v_proj (跟 prefix key 同一套)
-                pcd_key_vlm = vlm_layer.self_attn.k_proj(_pcd).view(
-                    *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
-                )
-                pcd_val_vlm = vlm_layer.self_attn.v_proj(_pcd).view(
-                    *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
-                )
-                # 第二段: expert k_proj/v_proj (跟 prefix key 进 expert 同一套)
-                _pcd_k = pcd_key_vlm.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
-                    *pcd_key_vlm.shape[:2], -1
-                )
-                pcd_key_exp = expert_layer.self_attn.k_proj(_pcd_k).view(
-                    *_pcd_k.shape[:-1], -1, expert_layer.self_attn.head_dim
-                )
-                _pcd_v = pcd_val_vlm.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
-                    *pcd_val_vlm.shape[:2], -1
-                )
-                pcd_val_exp = expert_layer.self_attn.v_proj(_pcd_v).view(
-                    *_pcd_v.shape[:-1], -1, expert_layer.self_attn.head_dim
-                )
-                # 拼到 expert key/value 后面
-                expert_key_states = torch.cat([expert_key_states, pcd_key_exp], dim=1)
-                expert_value_states = torch.cat([expert_value_states, pcd_val_exp], dim=1)
-                # mask 扩展: PCD 列全开 (action 都能看)
-                n_pcd_app = pcd_kv.shape[1]
-                pcd_mask = torch.ones(
-                    expert_attention_mask.shape[0],
-                    expert_attention_mask.shape[1],
-                    n_pcd_app,
-                    dtype=expert_attention_mask.dtype,
-                    device=expert_attention_mask.device,
-                )
-                expert_attention_mask = torch.cat([expert_attention_mask, pcd_mask], dim=2)
-
             att_output = attention_interface(
                 expert_attention_mask,
                 batch_size,

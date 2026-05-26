@@ -770,12 +770,6 @@ class VLAFlowMatching(nn.Module):
         # - ADD_PCD=0: 啥都不加, 等价 baseline A 的 prefix
         self.add_pcd = os.environ.get("ADD_PCD", "1") == "1"
 
-        # PCD_VLMOUT: PCD token 作为额外 key/value 注入 expert 的 cross-attn 层.
-        # PCD token (vla_hidden=960) 经 VLM k_proj → expert k_proj (跟 prefix key 同链)
-        # 投影成 key/value, 拼到 expert key 后面. 这样 expert 在每个 cross-attn 层都能
-        # attend 到 PCD.
-        self.pcd_vlmout = os.environ.get("PCD_VLMOUT", "0") == "1"
-
         # 总是创建 PCD encoder (即使 USE_PCD=0) — 保证 ckpt 始终含 PCD 参数,
         # USE_PCD=0 → USE_PCD=1 resume 时不会 "List length mismatch".
         # 当 USE_PCD=0 时, encoder 创建但 freeze + 不参与 forward.
@@ -794,53 +788,6 @@ class VLAFlowMatching(nn.Module):
             num_points=4096,
             cam_label="wrist",
         )
-
-        # PCD vlmout 缩放标量 (固定值, 不再可学习):
-        # PCD token 进 cross-attn key 前乘固定标量 (默认 0.09), 控制 magnitude.
-        # 仍用 nn.Parameter (而非 buffer) 保留, 但 requires_grad=False 固定,
-        # 这样旧 ckpt (含可学习版的这两个 key) resume 时不报 missing key.
-        # 写死理由: 实验决定固定此值, 不让训练改动 PCD 缩放.
-        # 等比缩放, 保留 PCD token 全部相对 magnitude 信息 (不像 LayerNorm 抹 magnitude).
-        PCD_VLMOUT_SCALE = float(os.environ.get("PCD_VLMOUT_SCALE", "0.2"))
-        self.pcd_vlmout_scale_agent = nn.Parameter(
-            torch.tensor(PCD_VLMOUT_SCALE, dtype=torch.float32)
-        )
-        self.pcd_vlmout_scale_wrist = nn.Parameter(
-            torch.tensor(PCD_VLMOUT_SCALE, dtype=torch.float32)
-        )
-        # 固定, 永不训练 (无论是否 vlmout 模式)
-        self.pcd_vlmout_scale_agent.requires_grad = False
-        self.pcd_vlmout_scale_wrist.requires_grad = False
-
-        # PCD vlmout 瓶颈 MLP (C: 960→256→960, GELU): PCD token ×0.09 后过 MLP 再拼入
-        # cross-attn key. 瓶颈降维省参数 + 防过拟合. agent/wrist 独立 MLP.
-        # 顺序: PointNet → ×0.09 → MLP → cross-attn key.
-        # MLP 可训练 (从 vanilla 起随机初始化). 永远创建保证 ckpt 结构一致; 非 vlmout freeze.
-        PCD_VLMOUT_MLP_HIDDEN = int(os.environ.get("PCD_VLMOUT_MLP_HIDDEN", "256"))
-
-        def _make_pcd_mlp(d_in, d_hidden):
-            return nn.Sequential(
-                nn.Linear(d_in, d_hidden),
-                nn.GELU(),
-                nn.Linear(d_hidden, d_in),
-            )
-
-        self.pcd_vlmout_mlp_agent = _make_pcd_mlp(vla_hidden, PCD_VLMOUT_MLP_HIDDEN)
-        self.pcd_vlmout_mlp_wrist = _make_pcd_mlp(vla_hidden, PCD_VLMOUT_MLP_HIDDEN)
-        if not self.pcd_vlmout:
-            for p in self.pcd_vlmout_mlp_agent.parameters():
-                p.requires_grad = False
-            for p in self.pcd_vlmout_mlp_wrist.parameters():
-                p.requires_grad = False
-
-        if self.pcd_vlmout:
-            print(
-                f"[PCD_VLMOUT] FIXED scalar scale={PCD_VLMOUT_SCALE} (agent+wrist, NOT trainable) "
-                f"→ bottleneck MLP ({vla_hidden}→{PCD_VLMOUT_MLP_HIDDEN}→{vla_hidden}, GELU, "
-                f"agent/wrist independent, trainable). Order: PointNet → ×scale → MLP → cross-attn key."
-            )
-
-        # =================================================================
 
         # =================================================================
         # Placeholder + Modality embeddings
@@ -1211,9 +1158,7 @@ class VLAFlowMatching(nn.Module):
             #      不破坏其他 token 间的 attention 强度.
             #   2) PCD token 加 sqrt(d) magnitude alignment (跟 RGB / lang 一致).
             # ===================================================================
-            # ===================================================================
-            # PCD_VLMOUT 时跳过 prefix 注入 (PCD 改在 cross-attn key 注入)
-            if self.add_pcd and not self.pcd_vlmout:
+            if self.add_pcd:
                 B_cam = img.shape[0]
                 vla_hidden = self.vlm_with_expert.config.text_config.hidden_size
                 target_dtype = embs[-1].dtype
@@ -1357,60 +1302,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def _compute_pcd_kv_token(self, depths, dtype):
-        """PCD_VLMOUT 模式: 算 PCD token (B, n_pcd, vla_hidden).
-        顺序: PointNet → ×固定标量(0.09) → 瓶颈 MLP → cross-attn key.
-        标量等比缩放保留 magnitude 信息; MLP 做特征变换.
-        返回 None 表示无 PCD (不注入).
-        """
-        if not (self.pcd_vlmout and self.add_pcd and self.use_pcd):
-            return None
-        if depths is None:
-            return None
-        # decode depth (跟 embed_prefix 一致)
-        dec = [decode_depth(d) if d is not None else None for d in depths]
-        toks = []
-        raw_norms = []      # log: PointNet 输出 (缩放前) norm
-        scaled_norms = []   # log: ×0.09 后 (MLP 前) norm
-        for _img_idx, (enc, scale, mlp) in enumerate([
-            (self.pcd_encoder_agent, self.pcd_vlmout_scale_agent, self.pcd_vlmout_mlp_agent),
-            (self.pcd_encoder_wrist, self.pcd_vlmout_scale_wrist, self.pcd_vlmout_mlp_wrist),
-        ]):
-            if _img_idx < len(dec) and dec[_img_idx] is not None:
-                d = dec[_img_idx]
-                if d.ndim == 4 and d.shape[1] == 1:
-                    d = d.squeeze(1)
-                tok = enc(d, target_dtype=dtype)   # (B,1,vla_hidden=960)
-                with torch.no_grad():
-                    raw_norms.append(tok.float().norm(dim=-1).mean().item())
-                # 1) 固定标量缩放 (×0.09, 等比保留 magnitude 信息)
-                tok = tok * scale.to(dtype=tok.dtype)
-                with torch.no_grad():
-                    scaled_norms.append(tok.float().norm(dim=-1).mean().item())
-                # 2) 瓶颈 MLP 变换
-                tok = mlp(tok)
-                tok = tok.to(dtype=dtype)
-                toks.append(tok)
-        if len(toks) == 0:
-            return None
-        result = torch.cat(toks, dim=1)   # (B, n_pcd, 960)
-
-        # 一次性 log: 标量值 + 三阶段 norm (raw → ×scale → MLP 后)
-        if not getattr(self, "_vlmout_scale_log_done", False):
-            with torch.no_grad():
-                a = self.pcd_vlmout_scale_agent.item()
-                w = self.pcd_vlmout_scale_wrist.item()
-                mlp_norm = result.float().norm(dim=-1).mean().item()
-                raw_str = ", ".join(f"{n:.2f}" for n in raw_norms)
-                scaled_str = ", ".join(f"{n:.2f}" for n in scaled_norms)
-                print(
-                    f"[PCD_VLMOUT] scale: agent={a:.4f} wrist={w:.4f}  | "
-                    f"norm: raw=[{raw_str}] → ×scale=[{scaled_str}] → MLP_out={mlp_norm:.2f}"
-                )
-            self._vlmout_scale_log_done = True
-        return result
-
-    def embed_suffix(self, noisy_actions, timestep, depths=None):
+    def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -1483,7 +1375,7 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state, depths=depths
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, depths=depths)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1500,7 +1392,7 @@ class VLAFlowMatching(nn.Module):
         # ============================================================
         probe_attn_now = False
         try:
-            probe_freq = int(os.environ.get("ATTN_PROBE_FREQ", "1000"))
+            probe_freq = int(os.environ.get("ATTN_PROBE_FREQ", "2000"))
         except ValueError:
             probe_freq = 0
         if probe_freq > 0 and self.add_pcd:
@@ -1513,15 +1405,6 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert._probe_attn_buf = []
         # ============================================================
 
-        # PCD_VLMOUT: 算 PCD token 存到 vlm_with_expert, cross-attn 层会拼进 expert key
-        self.vlm_with_expert._pcd_kv_token = self._compute_pcd_kv_token(
-            depths, prefix_embs.dtype
-        )
-        self._n_pcd_vlmout = (
-            self.vlm_with_expert._pcd_kv_token.shape[1]
-            if self.vlm_with_expert._pcd_kv_token is not None else 0
-        )
-
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
@@ -1530,8 +1413,6 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
-        # 清理, 避免泄漏到下次 forward
-        self.vlm_with_expert._pcd_kv_token = None
 
         # ============================================================
         # ATTENTION PROBE: 分析缓存的 probs, print 每层对 PCD 列的关注度
@@ -1542,20 +1423,11 @@ class VLAFlowMatching(nn.Module):
         # 因为这才是"主干在生成 action 时多看 PCD 的程度".
         # ============================================================
         if probe_attn_now and hasattr(self.vlm_with_expert, "_probe_attn_buf"):
-            if self.pcd_vlmout:
-                # vlmout 模式: PCD 拼在 cross-attn 的 expert key 末尾 (最后 n_pcd 列)
-                self._analyze_pcd_attn_vlmout(
-                    self.vlm_with_expert._probe_attn_buf,
-                    prefix_embs.shape[1],
-                    suffix_embs.shape[1],
-                    getattr(self, "_n_pcd_vlmout", 0),
-                )
-            else:
-                self._analyze_pcd_attn(
-                    self.vlm_with_expert._probe_attn_buf,
-                    prefix_embs.shape[1],
-                    suffix_embs.shape[1],
-                )
+            self._analyze_pcd_attn(
+                self.vlm_with_expert._probe_attn_buf,
+                prefix_embs.shape[1],
+                suffix_embs.shape[1],
+            )
             # 清理: 关探针, 释放 buf, 避免下次默认 forward 还在缓存
             self.vlm_with_expert._probe_attn = False
             self.vlm_with_expert._probe_attn_buf = []
@@ -1649,52 +1521,6 @@ class VLAFlowMatching(nn.Module):
             )
             print(f"[AttnProbe] L{layer_idx}: {e_str}  {p_str}")
 
-    def _analyze_pcd_attn_vlmout(self, probs_list, prefix_len, suffix_len, n_pcd):
-        """
-        vlmout 模式 AttnProbe. PCD 拼在 cross-attn 的 expert key 末尾.
-        cross-attn 层 expert probs: q=suffix_len, k=prefix_len+n_pcd.
-        PCD 在最后 n_pcd 列 (即 k 维度的 prefix_len..prefix_len+n_pcd-1).
-        分析 action query (suffix 末尾 chunk_size) → PCD key.
-        self-attn 层 (q==k==prefix+suffix) 不拼 PCD (我们只在 cross-attn 注入), 跳过.
-        """
-        if not probs_list or n_pcd <= 0:
-            print(f"[AttnProbe-vlmout] no PCD (n_pcd={n_pcd}), skip")
-            return
-
-        chunk_size = self.config.chunk_size
-        shape_pairs = [(p.shape[-2], p.shape[-1]) for p in probs_list]
-        print(f"[AttnProbe-vlmout] prefix_len={prefix_len}, suffix_len={suffix_len}, "
-              f"n_pcd={n_pcd}")
-        print(f"[AttnProbe-vlmout] (q,k) pairs: {shape_pairs}")
-
-        n_cross = 0
-        for layer_idx, probs in enumerate(probs_list):
-            q_len = probs.shape[-2]
-            k_len = probs.shape[-1]
-            # cross-attn 层 expert: q==suffix_len, k==prefix_len+n_pcd (拼了 PCD)
-            if q_len != suffix_len:
-                continue
-            if k_len < prefix_len + n_pcd:
-                # 没拼 PCD 的层 (或 self-attn), 跳过
-                continue
-            n_cross += 1
-            # PCD 在 k 的最后 n_pcd 列
-            pcd_cols = list(range(k_len - n_pcd, k_len))
-            uniform = 1.0 / k_len
-            # action query = suffix 末尾 chunk_size 行
-            action_q_start = suffix_len - chunk_size
-            action_block = probs[:, :, action_q_start:suffix_len, :][:, :, :, pcd_cols]
-            action_to_pcd = torch.nanmean(action_block.float()).item()
-            ratio = action_to_pcd / uniform if uniform > 0 else 0.0
-            print(f"[AttnProbe-vlmout] L{layer_idx} (cross, q={q_len},k={k_len}): "
-                  f"action→PCD={action_to_pcd:.5f} ({ratio:.2f}× uniform, pcd_cols={pcd_cols})")
-
-        if n_cross == 0:
-            print(f"[AttnProbe-vlmout] no cross-attn layers with PCD found. "
-                  f"(q,k) pairs: {shape_pairs}")
-        else:
-            print(f"[AttnProbe-vlmout] analyzed {n_cross} cross-attn layers (PCD in last {n_pcd} key cols).")
-
     def sample_actions(
         self,
         images,
@@ -1742,7 +1568,6 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
-                    depths=depths,
                 )
 
             if self._rtc_enabled():
@@ -1774,10 +1599,9 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
-        depths=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, depths=depths)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1790,11 +1614,6 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        # PCD_VLMOUT: 算 PCD token (inference 每个 denoise step 重算)
-        self.vlm_with_expert._pcd_kv_token = self._compute_pcd_kv_token(
-            depths, suffix_embs.dtype
-        )
-
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
@@ -1803,7 +1622,6 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
-        self.vlm_with_expert._pcd_kv_token = None
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)

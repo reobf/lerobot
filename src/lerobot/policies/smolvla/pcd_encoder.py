@@ -46,6 +46,7 @@ Reference:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -164,10 +165,22 @@ class PCDDepthEncoder(nn.Module):
         self.num_points = num_points
         self.cam_label = cam_label
 
+        # ---- 2x2 patch 开关 (env var, 默认关) ----
+        # USE_2X2_PATCH=1: 除了 global PointNet, 额外创建 4 个 quadrant PointNet,
+        # 每个看 2x2 分割的一个象限 (1024 点 / quadrant). 输出 5 个 token / cam.
+        # 关闭时 (默认), 只创建 global PointNet, 输出 1 token, 跟原版完全一致.
+        # 开关在创建时生效, ckpt state_dict 只包含实际创建的模块,
+        # 关闭时 ckpt 不会污染.
+        self.use_2x2_patch = os.environ.get("USE_2X2_PATCH", "0") == "1"
+
         # ---- 反投影 grid ----
         self.grid_size = int(math.sqrt(num_points))
         assert self.grid_size * self.grid_size == num_points, \
             f"num_points={num_points} must be a perfect square"
+
+        if self.use_2x2_patch:
+            assert self.grid_size % 2 == 0, \
+                f"grid_size={self.grid_size} must be even for 2x2 patch split"
 
         fx, fy = _fovy_to_fx_fy(fovy_deg, img_size)
         cx, cy = img_size / 2.0, img_size / 2.0
@@ -184,20 +197,39 @@ class PCDDepthEncoder(nn.Module):
         self.register_buffer("u_grid", uu.flatten())
         self.register_buffer("v_grid", vv.flatten())
 
-        # ---- PointNet body (跟 3D-CAVLA 一致, BatchNorm1d) ----
+        # ---- Global PointNet (永远创建, 跟原版一致) ----
         self.pointnet = PointNetEncoder()
 
-        # ---- Linear projection 1024 → vla_hidden (跟 3D-CAVLA 一致) ----
-        # 3D-CAVLA 用 nn.Linear(1024, 4096), 我们 nn.Linear(1024, 960)
+        # ---- 4 个 quadrant PointNet (只在 USE_2X2_PATCH=1 时创建) ----
+        # 不用 self.pointnet_patches = None 占位, 直接不创建,
+        # 这样 state_dict 不会包含 "pointnet_patches.X.*" key.
+        if self.use_2x2_patch:
+            self.pointnet_patches = nn.ModuleList([
+                PointNetEncoder() for _ in range(4)
+            ])
+
+        # ---- Linear projection 1024 → vla_hidden (共享, 5 个 PointNet 都用这一个) ----
         self.proj = nn.Linear(1024, vla_hidden)
 
         self._dbg_done = False
 
-        print(
-            f"[PCDEncoder.{cam_label}] 3D-CAVLA mimic config (BatchNorm1d): "
-            f"fovy={fovy_deg}° img_size={img_size} num_points={num_points} → "
-            f"PointNet → Linear(1024, {vla_hidden}) → 1 token"
-        )
+        if self.use_2x2_patch:
+            print(
+                f"[PCDEncoder.{cam_label}] 2x2 patch mode: "
+                f"fovy={fovy_deg}° img_size={img_size} num_points={num_points} → "
+                f"5 PointNets (1 global + 4 quadrants), shared Linear(1024, {vla_hidden}) → 5 tokens"
+            )
+        else:
+            print(
+                f"[PCDEncoder.{cam_label}] 3D-CAVLA mimic config (BatchNorm1d): "
+                f"fovy={fovy_deg}° img_size={img_size} num_points={num_points} → "
+                f"PointNet → Linear(1024, {vla_hidden}) → 1 token"
+            )
+
+    @property
+    def num_tokens(self) -> int:
+        """Tokens / cam, 用于 modeling_smolvla 创建 placeholder 时确定 shape."""
+        return 5 if self.use_2x2_patch else 1
 
     def _backproject(self, depth_m: torch.Tensor) -> torch.Tensor:
         """depth_m: (B, H, W) → (B, num_points, 3) in camera frame.
@@ -239,13 +271,43 @@ class PCDDepthEncoder(nn.Module):
     def forward(self, depth_m: torch.Tensor, target_dtype: torch.dtype = None) -> torch.Tensor:
         """
         depth_m: (B, H, W) depth in meters
-        return:  (B, 1, vla_hidden) — 直接送 prefix, 没 norm/scale/gate/mod_emb
+        return:
+          - USE_2X2_PATCH=0 (默认): (B, 1, vla_hidden) — 1 个 global token
+          - USE_2X2_PATCH=1:        (B, 5, vla_hidden) — 1 global + 4 quadrant tokens
         """
         depth_f32 = depth_m.float()
 
         points = self._backproject(depth_f32)         # (B, N, 3)
-        feat = self.pointnet(points)                  # (B, 1024)
-        token = self.proj(feat).unsqueeze(1)          # (B, 1, vla_hidden)
+        B = points.shape[0]
+
+        # Global PointNet (永远跑)
+        feat_global = self.pointnet(points)            # (B, 1024)
+        token_global = self.proj(feat_global).unsqueeze(1)  # (B, 1, vla_hidden)
+
+        if not self.use_2x2_patch:
+            # 单 token 模式 — 跟原版一致
+            token = token_global
+        else:
+            # 5 token 模式: 1 global + 4 quadrants
+            # 把 image-grid 点切 2x2:
+            # points (B, N=4096, 3) → (B, grid_size, grid_size, 3) → 4 个象限各 (grid/2)^2 点
+            half = self.grid_size // 2
+            points_grid = points.view(B, self.grid_size, self.grid_size, 3)
+            # 切 2x2: (B, 2, half, 2, half, 3) → permute → (B, 4, half*half, 3)
+            patches = points_grid.view(B, 2, half, 2, half, 3)
+            patches = patches.permute(0, 1, 3, 2, 4, 5).contiguous()
+            patches = patches.view(B, 4, half * half, 3)   # (B, 4, 1024, 3)
+
+            # 4 个独立 PointNet 各处理一个象限
+            quadrant_tokens = []
+            for i, pn in enumerate(self.pointnet_patches):
+                feat_q = pn(patches[:, i])                  # (B, 1024)
+                tok_q = self.proj(feat_q).unsqueeze(1)      # (B, 1, vla_hidden)
+                quadrant_tokens.append(tok_q)
+
+            # Concat: global 在前, 4 quadrants 在后
+            token = torch.cat([token_global] + quadrant_tokens, dim=1)  # (B, 5, vla_hidden)
+
         if target_dtype is not None:
             token = token.to(target_dtype)
 
@@ -255,7 +317,7 @@ class PCDDepthEncoder(nn.Module):
                 token_std = token.float().std().item()
                 token_norm = token.float().norm(dim=-1).mean().item()
                 points_std = points.std().item()
-                feat_std = feat.std().item()
+                feat_std = feat_global.std().item()
                 z = points[..., 2]
                 z_min_obs = z.min().item()
                 z_max_obs = z.max().item()
@@ -269,8 +331,8 @@ class PCDDepthEncoder(nn.Module):
                     f"std={points_std:.3f}, z=[{z_min_obs:.3f}, {z_max_obs:.3f}] z_mean={z_mean_obs:.3f}"
                 )
                 print(
-                    f"[PCDEncoder.{self.cam_label}] feat std={feat_std:.3f}  →  "
-                    f"token std={token_std:.4f} norm={token_norm:.4f}"
+                    f"[PCDEncoder.{self.cam_label}] feat_global std={feat_std:.3f}  →  "
+                    f"out tokens={tuple(token.shape)} std={token_std:.4f} norm/tok={token_norm:.4f}"
                 )
             self._dbg_done = True
 
