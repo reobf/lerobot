@@ -291,6 +291,50 @@ class SmolVLMWithExpertModel(nn.Module):
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
 
+        # ===================================================================
+        # PCD (expert-only inject, PCD_INJECT=1): self-attn 层也拼 PCD key/value.
+        # self-attn 是 [prefix + suffix] 拼一起做 attention, key_states 由 prefix(VLM
+        # k_proj 输出) + suffix(expert k_proj 输出) 拼成, 维度都是 num_kv_heads×head_dim.
+        # PCD 只需走 VLM k_proj/v_proj 一段 (输出即 num_kv_heads×head_dim, 跟 key_states
+        # 维度一致), 直接拼到 key/value 末尾. 不走 expert k_proj 第二段 (那是 cross-attn
+        # 的 VLM-key 二次投影链, self-attn 不适用).
+        # mask 只让 action (suffix) 行看 PCD, prefix 行看不到 (维持 frozen VLM 不污染).
+        # 不加 RoPE (几何 condition 无位置). PCD 不进 cache (每次重算).
+        # ===================================================================
+        pcd_kv = getattr(self, "_pcd_kv_token", None)
+        if pcd_kv is not None:
+            vlm_layer = model_layers[0][layer_idx]
+            if vlm_layer is not None:
+                _pcd = pcd_kv.to(dtype=vlm_layer.self_attn.k_proj.weight.dtype)
+                # 走 VLM k_proj/v_proj → (B, n_pcd, num_kv_heads, head_dim)
+                pcd_key = vlm_layer.self_attn.k_proj(_pcd).view(
+                    *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
+                ).to(dtype=key_states.dtype)
+                pcd_val = vlm_layer.self_attn.v_proj(_pcd).view(
+                    *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
+                ).to(dtype=value_states.dtype)
+                # 拼到 key/value 末尾 (不加 RoPE)
+                key_states = torch.cat([key_states, pcd_key], dim=1)
+                value_states = torch.cat([value_states, pcd_val], dim=1)
+
+                # mask 扩展: PCD 列只对 suffix (action) 行 = 1, prefix 行 = 0.
+                # attention_mask_ shape = (B, q_len, k_len). q_len = 当前序列长度.
+                # suffix (action) 是序列末尾 _pcd_n_suffix 个 token.
+                n_pcd_app = pcd_kv.shape[1]
+                q_len = attention_mask_.shape[1]
+                n_suffix = getattr(self, "_pcd_n_suffix", None)
+                pcd_col = torch.zeros(
+                    attention_mask_.shape[0], q_len, n_pcd_app,
+                    dtype=attention_mask_.dtype, device=attention_mask_.device,
+                )
+                if n_suffix is not None and n_suffix > 0:
+                    # 末尾 n_suffix 行 (action) 能看 PCD
+                    pcd_col[:, -n_suffix:, :] = 1
+                else:
+                    # 兜底: 若没设 n_suffix, 全行可见 (退化为旧行为)
+                    pcd_col[:] = 1
+                attention_mask_ = torch.cat([attention_mask_, pcd_col], dim=2)
+
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
