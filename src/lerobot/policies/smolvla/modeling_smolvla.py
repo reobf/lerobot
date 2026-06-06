@@ -51,8 +51,26 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 ```
 
 """
-from lerobot.policies.smolvla.pcdpp_encoder import PCDDepthEncoder
 import os
+# PCD_IMPL: 选择 PCD encoder 实现.
+#   "PCD" (默认): pcd_encoder.py — 原版 PointNet w/ T-Net + BN + Linear 1024→960
+#   "PCDPP":      pcdpp_encoder.py — PointNet++ MSG 轻量版 + Linear 512→960
+#   "IDP3":       idp3_encoder.py — iDP3 multi-stage PointNet, 直接出 960 (无 T-Net 无 BN)
+# 三个文件都暴露 class PCDDepthEncoder, 接口完全一致 (drop-in 替换).
+_PCD_IMPL = os.environ.get("PCD_IMPL", "PCD").upper()
+if _PCD_IMPL == "PCDPP":
+    from lerobot.policies.smolvla.pcdpp_encoder import PCDDepthEncoder
+elif _PCD_IMPL == "IDP3":
+    from lerobot.policies.smolvla.idp3_encoder import PCDDepthEncoder
+elif _PCD_IMPL == "PCD":
+    from lerobot.policies.smolvla.pcd_encoder import PCDDepthEncoder
+else:
+    raise ValueError(
+        f"PCD_IMPL={_PCD_IMPL!r} not recognized. Use 'PCD' (default) / 'PCDPP' / 'IDP3'."
+    )
+print(f"[PCD] using encoder implementation: {_PCD_IMPL}")
+
+from lerobot.policies.smolvla.lora_module import wrap_vlm_lora
 import math
 from collections import deque
 from typing import TypedDict, Unpack
@@ -897,6 +915,111 @@ class VLAFlowMatching(nn.Module):
 
         self.set_requires_grad()
 
+        # =================================================================
+        # SKIP_EXPERT_LAYER (env, skip-block analysis 用):
+        # 把 expert 第 N 层替换成 IdentityExpertLayer (forward 直接 pass-through),
+        # 用于测该层重要性. 设 SKIP_EXPERT_LAYER=N (0-indexed) 跳第 N 层.
+        # 仅 eval 时用, 训练时不要设.
+        # =================================================================
+        _skip_layer_env = os.environ.get("SKIP_EXPERT_LAYER", "").strip()
+        if _skip_layer_env:
+            try:
+                skip_idx = int(_skip_layer_env)
+                expert_layers = self.vlm_with_expert.lm_expert.layers
+                n_expert_layers = len(expert_layers)
+                if 0 <= skip_idx < n_expert_layers:
+                    class _IdentityExpertLayer(nn.Module):
+                        """Pass-through expert layer: 不做任何计算, 直接返回 hidden_states.
+                        模拟 SmolVLM decoder layer 接口 (返回 tuple of hidden_states + optional KV).
+                        """
+                        def forward(self, hidden_states, *args, **kwargs):
+                            # SmolVLM2 decoder layer 一般返回 (hidden_states,) 或带 KV cache 的 tuple
+                            output_attentions = kwargs.get("output_attentions", False)
+                            use_cache = kwargs.get("use_cache", False)
+                            outputs = (hidden_states,)
+                            if output_attentions:
+                                outputs = outputs + (None,)
+                            if use_cache:
+                                outputs = outputs + (None,)
+                            return outputs
+
+                    print("=" * 70)
+                    print(f"[SKIP-BLOCK] replacing expert layer {skip_idx} with Identity "
+                          f"(of {n_expert_layers} total expert layers)")
+                    print("=" * 70)
+                    expert_layers[skip_idx] = _IdentityExpertLayer()
+                else:
+                    print(f"[SKIP-BLOCK] WARN: SKIP_EXPERT_LAYER={skip_idx} out of range "
+                          f"[0, {n_expert_layers}), skipping replacement")
+            except ValueError:
+                print(f"[SKIP-BLOCK] WARN: SKIP_EXPERT_LAYER={_skip_layer_env!r} not int, ignoring")
+
+        # =================================================================
+        # LoRA: 如果 env LORA_RANK > 0, 给 VLM 16 层 self_attn 的 q/k/v/o_proj 加 LoRA.
+        # 必须在 set_requires_grad() (它会 freeze VLM) 之后, 因为 wrap_vlm_lora
+        # 创建新 lora_A/lora_B Parameter, 默认 requires_grad=True, 不会被前面 freeze 影响.
+        # base weight/bias 永久 freeze (LoRALinear 内部已设).
+        #
+        # ckpt 兼容:
+        #   - lora→lora: strict=False 加载, lora_A/B key 名一致, 直接续训.
+        #   - 非lora→lora: ckpt 无 lora_A/B, strict=False 跳过, 走默认初始化
+        #     (lora_A Kaiming, lora_B 0 → 启动行为 = vanilla, 然后渐进学习). ✓
+        # =================================================================
+        lora_rank = int(os.environ.get("LORA_RANK", "0"))
+        if lora_rank > 0:
+            # alpha 默认 = rank / 2 (跟 3D-CAVLA 风格一致: 保守 scaling), env 可覆盖
+            lora_alpha = float(os.environ.get("LORA_ALPHA", str(lora_rank / 2)))
+            # LORA_FFN=1 时同时包 FFN (gate/up/down_proj), 默认 0 仅 attention
+            lora_ffn = int(os.environ.get("LORA_FFN", "0")) == 1
+            print("=" * 70)
+            print(f"[LoRA] LORA_RANK={lora_rank} (env), LORA_ALPHA={lora_alpha} "
+                  f"(env LORA_ALPHA or default rank/2), LORA_FFN={int(lora_ffn)}")
+            target_desc = "q/k/v/o_proj" + (" + gate/up/down_proj (FFN)" if lora_ffn else "")
+            print(f"[LoRA] Target: VLM text_model layers — {target_desc} only "
+                  f"(NOT SigLIP, NOT expert)")
+            wrap_vlm_lora(
+                self.vlm_with_expert.get_vlm_model().text_model,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                include_ffn=lora_ffn,
+                verbose=True,
+            )
+
+            # ---- Sanity check: state_dict key 结构 ----
+            # 期望 (16 VLM 层):
+            #   attn (q/k/v/o): 64 lora_A + 64 lora_B + 64 base.weight
+            #   +FFN (gate/up/down): +48 lora_A + 48 lora_B + 48 base.weight
+            with torch.no_grad():
+                _sd = self.state_dict()
+                _lora_a = [k for k in _sd if k.endswith(".lora_A")]
+                _lora_b = [k for k in _sd if k.endswith(".lora_B")]
+                _attn_proj = [
+                    k for k in _sd
+                    if (".text_model.layers." in k
+                        and any(f".self_attn.{p}.weight" in k for p in ["q_proj", "k_proj", "v_proj", "o_proj"]))
+                ]
+                _ffn_proj = [
+                    k for k in _sd
+                    if (".text_model.layers." in k
+                        and any(f".mlp.{p}.weight" in k for p in ["gate_proj", "up_proj", "down_proj"]))
+                ]
+                expected_lora = 64 + (48 if lora_ffn else 0)
+                print(
+                    f"[LoRA-SanityCheck] lora_A keys={len(_lora_a)} (expect {expected_lora}), "
+                    f"lora_B keys={len(_lora_b)} (expect {expected_lora})"
+                )
+                print(
+                    f"[LoRA-SanityCheck] VLM attn proj.weight keys={len(_attn_proj)} (expect 64), "
+                    f"VLM ffn proj.weight keys={len(_ffn_proj)} (expect 48)"
+                )
+                print(f"[LoRA-SanityCheck] sample lora_A: {_lora_a[0] if _lora_a else '(none!)'}")
+                if (len(_lora_a) != expected_lora or len(_lora_b) != expected_lora):
+                    print(
+                        f"[LoRA-SanityCheck] WARN: lora counts mismatch! "
+                        f"Check wrap_vlm_lora scope (layer paths, attribute names)."
+                    )
+            print("=" * 70)
+
         # PCD diagnostic — set_requires_grad 之后检查
         if self.use_pcd:
             print("=" * 70)
@@ -999,27 +1122,30 @@ class VLAFlowMatching(nn.Module):
         _token_log = [] if _do_token_mag_log else None
 
         # ===================================================================
-        # 4F prefix-mode 模态 mask: 训练时按 MASK_RATE% 概率整体零化 PCD (agent+wrist 同时).
-        # 在 cam 循环前算每 sample 的 keep 决策, 循环里两个 cam 共用同一个 mask.
-        # 只对 PCD_INJECT=0 (prefix 模式) 生效; expert-only 模式由 _compute_pcd_kv_token 处理.
+        # Modality dropout (prefix 模式): 训练时按 MASK_RATE% 概率整体零化 PCD.
+        # 强制模型不依赖单一模态. agent+wrist 同时, per-sample bernoulli.
+        # 仅 prefix 模式 (PCD_INJECT=0) 生效; expert 模式由 _compute_pcd_kv_token 处理.
         # eval 自动关 (self.training=False).
         # ===================================================================
         self._prefix_pcd_keep = None
         if self.training and self.add_pcd and not self.pcd_vlmout:
-            mask_rate = float(os.environ.get("MASK_RATE", "15")) / 100.0
+            try:
+                mask_rate = float(os.environ.get("MASK_RATE", "15")) / 100.0
+            except ValueError:
+                mask_rate = 0.15
             if mask_rate > 0 and len(images) > 0:
                 B = images[0].shape[0]
                 device = images[0].device
-                # (B,) 每 sample 一个 bernoulli (1=保留 PCD, 0=mask 整个 PCD)
+                # (B,) bernoulli: 1 = 保留 PCD, 0 = mask 整个 PCD
                 self._prefix_pcd_keep = (
                     torch.rand(B, device=device) >= mask_rate
                 ).float()
-                if not getattr(self, "_prefix_modality_mask_log_done", False):
+                if not getattr(self, "_prefix_mask_log_done", False):
                     print(
-                        f"[PCD] 4F prefix-mode modality mask enabled: MASK_RATE={mask_rate*100:.0f}% "
+                        f"[PCD] modality dropout (prefix) enabled: MASK_RATE={mask_rate*100:.0f}% "
                         f"(per-sample, agent+wrist together). Training only."
                     )
-                    self._prefix_modality_mask_log_done = True
+                    self._prefix_mask_log_done = True
 
         for _img_idx, (
             img,
@@ -1114,62 +1240,6 @@ class VLAFlowMatching(nn.Module):
             # 标准 SigLIP → connector → 64 image tokens
             img_emb = self.vlm_with_expert.embed_image(img)          # (B, 64, 960)
 
-            # ============================================================
-            # RGB Token Compression (env var 控制, 默认开)
-            # ----------------------------------------------------------------
-            # RGB_COMPRESS=N (perfect square 4/9/16/25/36/49) → 用 adaptive
-            #   avg pool 把 8×8=64 token 压缩成 √N × √N = N 个 token.
-            # 默认 RGB_COMPRESS=9 (8×8 → 3×3, 节省 86% prefix 长度).
-            # 设 RGB_COMPRESS=0 关闭压缩 (用 vanilla 64 token, 跟 SmolVLA 论文一致).
-            # 设 RGB_COMPRESS=64 也等价不压缩 (8×8 → 8×8, no-op).
-            #
-            # Why pool (not learn): connector 已经把 raw 特征压缩好了, 我们
-            #   再压一次只用 average pool 不引入新参数, 也不破坏 SmolVLA 预训练.
-            # Why default 9: 9 token 让 batch size 能拉到 80+ (比 64 token 的
-            #   bs=20 有 4× 余量), 适合做 PCD ablation 跑得快. SmolVLA 论文
-            #   也有早期实验用 4-9 token 做 token-efficient 配置.
-            # ============================================================
-            try:
-                rgb_compress = int(os.environ.get("RGB_COMPRESS", "9"))
-            except ValueError:
-                rgb_compress = 9
-            if rgb_compress > 0:
-                B_rgb, N_rgb, D_rgb = img_emb.shape  # 期望 N_rgb=64
-                # 输入必须是 perfect square (8×8=64)
-                src_grid = int(N_rgb ** 0.5)
-                tgt_grid = int(rgb_compress ** 0.5)
-                if (src_grid * src_grid == N_rgb
-                        and tgt_grid * tgt_grid == rgb_compress
-                        and tgt_grid <= src_grid):
-                    # (B, N, D) → (B, D, src_grid, src_grid) → pool → (B, D, tgt, tgt) → (B, tgt², D)
-                    img_emb_grid = img_emb.transpose(1, 2).reshape(B_rgb, D_rgb, src_grid, src_grid)
-                    img_emb_grid = F.adaptive_avg_pool2d(img_emb_grid, (tgt_grid, tgt_grid))
-                    img_emb = img_emb_grid.reshape(B_rgb, D_rgb, rgb_compress).transpose(1, 2)
-
-                    # ---- Magnitude compensation ----
-                    # Avg pool 在 src/tgt 比例下让 std 下降 √(src/tgt) 倍.
-                    # 不补偿的话, RGB token 在主干 attention 里 magnitude 会变弱,
-                    # 影响 fair comparison vs baseline A.
-                    # 补偿系数 = √(每个 target cell 平均的 source 像素数)
-                    pool_factor = (src_grid / tgt_grid)
-                    img_emb = img_emb * pool_factor
-
-                    if not getattr(self, "_rgb_compress_logged", False):
-                        print(
-                            f"[RGB-Compress] enabled: {N_rgb} tokens → {rgb_compress} tokens "
-                            f"({src_grid}×{src_grid} → {tgt_grid}×{tgt_grid} adaptive_avg_pool2d, "
-                            f"magnitude × {pool_factor:.2f} compensation)"
-                        )
-                        self._rgb_compress_logged = True
-                else:
-                    if not getattr(self, "_rgb_compress_warned", False):
-                        print(
-                            f"[RGB-Compress] WARN: invalid config "
-                            f"(N_rgb={N_rgb}, rgb_compress={rgb_compress}). "
-                            f"src_grid={src_grid}, tgt_grid={tgt_grid}. Falling back to no compression."
-                        )
-                        self._rgb_compress_warned = True
-
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
@@ -1245,17 +1315,15 @@ class VLAFlowMatching(nn.Module):
 
                 pcd_mask = torch.ones(B_cam, 1, dtype=torch.bool, device=target_device)
 
-                # 4F: apply prefix-mode 模态 mask (agent+wrist 同时, 循环前算的 keep)
+                # apply prefix-mode modality mask (per-sample, agent+wrist 共享同一个 keep 决策)
                 if self._prefix_pcd_keep is not None:
                     keep = self._prefix_pcd_keep.to(dtype=pcd_token.dtype).view(B_cam, 1, 1)
                     pcd_token = pcd_token * keep
 
-                # 记录 PCD token 在 prefix 中的精确索引 (用于 attention probe)
+                # 记录 PCD token 在 prefix 中的精确索引 (AttnProbe prefix 模式用)
                 pcd_token_idx = sum(e.shape[1] for e in embs)
-                if not hasattr(self, "_last_pcd_indices"):
-                    self._last_pcd_indices = []
                 if _img_idx == 0:
-                    self._last_pcd_indices = []  # 重置 (每次 forward 都重新填)
+                    self._last_pcd_indices = []  # 每次 forward 重置
                 self._last_pcd_indices.append(pcd_token_idx)
 
                 embs.append(pcd_token)
@@ -1336,6 +1404,102 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    def _analyze_pcd_attn_prefix(self, probs_list, prefix_len, suffix_len):
+        """AttnProbe (prefix 模式): 分析每层 action query → prefix 中 PCD key 列的 attention.
+
+        PCD 列在 prefix 中的位置由 self._last_pcd_indices 给出 (每个 cam 一个 PCD token).
+        action query 是 suffix 末尾 chunk_size 行 (在 full sequence 的 prefix_len 之后).
+        probs shape per layer: (B, num_heads, total_seq, total_seq) 或 (B, num_heads, q, k).
+        """
+        if not probs_list:
+            print("[AttnProbe-prefix] no probs cached, skip")
+            return
+        pcd_indices = getattr(self, "_last_pcd_indices", None)
+        if not pcd_indices:
+            print("[AttnProbe-prefix] no PCD indices recorded, skip")
+            return
+
+        chunk_size = self.config.chunk_size
+        total_seq = prefix_len + suffix_len
+        # action query: suffix 末尾 chunk_size 行 = full_seq 的 [total-chunk_size, total)
+        action_q_start = total_seq - chunk_size
+        action_q_end = total_seq
+
+        print(f"[AttnProbe-prefix] prefix_len={prefix_len}, suffix_len={suffix_len}, "
+              f"pcd_indices={pcd_indices} (in prefix), action_q=[{action_q_start},{action_q_end})")
+        shape_pairs = [(p.shape[-2], p.shape[-1]) for p in probs_list]
+        print(f"[AttnProbe-prefix] (q,k) per layer: {shape_pairs[:8]}{'...' if len(shape_pairs)>8 else ''}")
+
+        n_analyzed = 0
+        for layer_idx, probs in enumerate(probs_list):
+            q_len = probs.shape[-2]
+            k_len = probs.shape[-1]
+            # 跳过不匹配的 (比如 cross-attn 层 q==suffix_len, 我们要 self-attn q==total_seq)
+            if q_len != total_seq or k_len != total_seq:
+                continue
+            n_analyzed += 1
+            # action 行
+            action_block = probs[:, :, action_q_start:action_q_end, :]
+            # PCD 列 (在 prefix 中)
+            action_to_pcd = action_block[:, :, :, pcd_indices].float()
+            mean_to_pcd = torch.nanmean(action_to_pcd).item()
+            uniform = 1.0 / k_len
+            ratio = mean_to_pcd / uniform if uniform > 0 else 0.0
+            print(f"[AttnProbe-prefix] L{layer_idx}: action→PCD={mean_to_pcd:.5f} "
+                  f"({ratio:.2f}× uniform)")
+
+        if n_analyzed == 0:
+            print(f"[AttnProbe-prefix] no matching (self-attn) layers found. "
+                  f"shapes: {shape_pairs}")
+        else:
+            print(f"[AttnProbe-prefix] analyzed {n_analyzed} layers.")
+
+    def _analyze_pcd_attn_expert(self, probs_list, prefix_len, suffix_len, n_pcd):
+        """AttnProbe (expert-only 模式): action query → PCD key (在 expert key 末尾).
+
+        Expert cross-attn: query=suffix (action, chunk_size 长), key=[prefix_proj, PCD_proj].
+        所以 probs shape per cross-attn 层: (B, num_heads, suffix_len, prefix_len + n_pcd).
+        Expert self-attn (如果有): query=key=[prefix, suffix, PCD], PCD 是末尾 n_pcd 列.
+        """
+        if not probs_list:
+            print("[AttnProbe-expert] no probs cached, skip")
+            return
+        if n_pcd <= 0:
+            print("[AttnProbe-expert] n_pcd=0, no PCD column to analyze")
+            return
+
+        print(f"[AttnProbe-expert] prefix_len={prefix_len}, suffix_len={suffix_len}, n_pcd={n_pcd}")
+        shape_pairs = [(p.shape[-2], p.shape[-1]) for p in probs_list]
+        print(f"[AttnProbe-expert] (q,k) per layer: {shape_pairs[:8]}{'...' if len(shape_pairs)>8 else ''}")
+
+        n_analyzed = 0
+        for layer_idx, probs in enumerate(probs_list):
+            q_len = probs.shape[-2]
+            k_len = probs.shape[-1]
+            # 期望 cross-attn (q=suffix, k=prefix+pcd) 或 self-attn (q=prefix+suffix, k=prefix+suffix+pcd)
+            if q_len == suffix_len and k_len == prefix_len + n_pcd:
+                # cross-attn 层: 所有 query (都是 action) 看末尾 n_pcd 列
+                pcd_block = probs[:, :, :, -n_pcd:].float()
+                mean_to_pcd = torch.nanmean(pcd_block).item()
+                tag = "cross"
+            elif q_len == prefix_len + suffix_len and k_len == prefix_len + suffix_len + n_pcd:
+                # self-attn 层: 只 action 行 (suffix) 看末尾 n_pcd 列
+                action_pcd = probs[:, :, prefix_len:, -n_pcd:].float()
+                mean_to_pcd = torch.nanmean(action_pcd).item()
+                tag = "self"
+            else:
+                continue
+            uniform = 1.0 / k_len
+            ratio = mean_to_pcd / uniform if uniform > 0 else 0.0
+            print(f"[AttnProbe-expert] L{layer_idx} ({tag}): action→PCD={mean_to_pcd:.5f} "
+                  f"({ratio:.2f}× uniform)")
+            n_analyzed += 1
+
+        if n_analyzed == 0:
+            print(f"[AttnProbe-expert] no matching layers found. shapes: {shape_pairs}")
+        else:
+            print(f"[AttnProbe-expert] analyzed {n_analyzed} layers.")
+
     def _compute_pcd_kv_token(self, depths, dtype):
         """PCD_INJECT=1 (expert-only) 模式: 算 PCD token (B, n_pcd, vla_hidden).
         顺序: PointNet → ×固定标量(0.09) → 瓶颈 MLP → expert key (cross-attn + self-attn).
@@ -1377,31 +1541,31 @@ class VLAFlowMatching(nn.Module):
                 scaled_norm = result.float().norm(dim=-1).mean().item()
                 raw_str = ", ".join(f"{n:.2f}" for n in raw_norms)
                 print(
-                    f"[PCD] (4E direct + modality mask) scale: agent={a:.4f} wrist={w:.4f}  | "
+                    f"[PCD] (4c direct) scale: agent={a:.4f} wrist={w:.4f}  | "
                     f"norm: raw=[{raw_str}] → ×scale={scaled_norm:.2f} (no MLP)"
                 )
             self._vlmout_scale_log_done = True
 
         # ===================================================================
-        # 4E 模态 mask: 训练时按 MASK_RATE% 概率整体零化 PCD (agent + wrist 同时).
-        # 防隐式过拟合, 让 expert 学到"PCD 可有可无", 同时获得 missing-depth 鲁棒性.
-        # token 数量不变 (永远 (B, n_pcd, 960)), 数值变 0, attention mask 不动.
-        # eval 模式自动关 (self.training=False), 永远输入完整 PCD.
+        # Modality dropout (expert 模式): 训练时按 MASK_RATE% 概率整体零化 PCD.
+        # 跟 prefix 一样, agent+wrist 同时, per-sample bernoulli, eval 自动关.
+        # token 形状不变 (B, n_pcd, vla_hidden), 值变 0, attn mask 不动.
         # ===================================================================
         if self.training:
-            mask_rate = float(os.environ.get("MASK_RATE", "15")) / 100.0
+            try:
+                mask_rate = float(os.environ.get("MASK_RATE", "15")) / 100.0
+            except ValueError:
+                mask_rate = 0.15
             if mask_rate > 0:
                 B = result.shape[0]
-                # 每个 sample 一个 bernoulli (1 = 保留, 0 = mask 整个 PCD)
                 keep = (torch.rand(B, device=result.device) >= mask_rate).to(result.dtype)
-                # broadcast: (B,) → (B, 1, 1) 跨 n_pcd 和 vla_hidden, agent+wrist 同时归零
                 result = result * keep.view(B, 1, 1)
-                if not getattr(self, "_modality_mask_log_done", False):
+                if not getattr(self, "_expert_mask_log_done", False):
                     print(
-                        f"[PCD] 4E modality mask enabled: MASK_RATE={mask_rate*100:.0f}% "
+                        f"[PCD] modality dropout (expert) enabled: MASK_RATE={mask_rate*100:.0f}% "
                         f"(per-sample, agent+wrist together). Training only."
                     )
-                    self._modality_mask_log_done = True
+                    self._expert_mask_log_done = True
 
         return result
 
@@ -1486,19 +1650,17 @@ class VLAFlowMatching(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        # ============================================================
-        # ATTENTION PROBE: 测主干每层 attention 对 PCD token 的 attention weight
-        # ----------------------------------------------------------------
-        # ATTN_PROBE_FREQ 环境变量控制采样频率 (默认 200 = 每 200 forward 探测一次).
-        # 设 0 关闭. 探测时 attention probs 被 detach 缓存到 vlm_with_expert,
-        # 不进梯度图, 但占额外显存 (B × num_layers × num_heads × seq² × 4 bytes).
-        # ============================================================
+        # AttnProbe: 按 ATTN_PROBE_FREQ env (默认 0 = 关) 周期性
+        # 缓存每层 attention probs, 分析 action query → PCD key 的关注度.
+        # 两种 PCD 注入模式都支持:
+        #   prefix (PCD_INJECT=0): PCD 在 prefix 序列里, 分析 self-attn 层 action→PCD
+        #   expert-only (PCD_INJECT=1): PCD 拼在 expert key 末尾, 分析 cross-attn 层 action→PCD
         probe_attn_now = False
         try:
-            probe_freq = int(os.environ.get("ATTN_PROBE_FREQ", "1000"))
+            probe_freq = int(os.environ.get("ATTN_PROBE_FREQ", "0"))
         except ValueError:
             probe_freq = 0
-        if probe_freq > 0 and self.add_pcd:
+        if probe_freq > 0 and self.use_pcd:
             if not hasattr(self, "_attn_probe_count"):
                 self._attn_probe_count = 0
             self._attn_probe_count += 1
@@ -1506,7 +1668,6 @@ class VLAFlowMatching(nn.Module):
         if probe_attn_now:
             self.vlm_with_expert._probe_attn = True
             self.vlm_with_expert._probe_attn_buf = []
-        # ============================================================
 
         # PCD expert-only (PCD_INJECT=1): 算 PCD token 存到 vlm_with_expert,
         # cross-attn + self-attn 层都会拼进 expert key (self-attn 只 action 行可见).
@@ -1532,33 +1693,25 @@ class VLAFlowMatching(nn.Module):
         self.vlm_with_expert._pcd_kv_token = None
         self.vlm_with_expert._pcd_n_suffix = None
 
-        # ============================================================
-        # ATTENTION PROBE: 分析缓存的 probs, print 每层对 PCD 列的关注度
-        # ----------------------------------------------------------------
-        # probs shape per layer: (B, num_heads, total_seq, total_seq)
-        # PCD 列在 prefix 中的位置由 self._last_pcd_indices 给出.
-        # 我们看 EXPERT (action expert) query → PCD key 的 attention,
-        # 因为这才是"主干在生成 action 时多看 PCD 的程度".
-        # ============================================================
+        # AttnProbe 分析
         if probe_attn_now and hasattr(self.vlm_with_expert, "_probe_attn_buf"):
             if self.pcd_vlmout:
-                # vlmout 模式: PCD 拼在 cross-attn 的 expert key 末尾 (最后 n_pcd 列)
-                self._analyze_pcd_attn_vlmout(
+                # expert-only: PCD 在 expert key 末尾 (最后 n_pcd 列)
+                self._analyze_pcd_attn_expert(
                     self.vlm_with_expert._probe_attn_buf,
                     prefix_embs.shape[1],
                     suffix_embs.shape[1],
                     getattr(self, "_n_pcd_vlmout", 0),
                 )
             else:
-                self._analyze_pcd_attn(
+                # prefix: PCD 在 prefix 序列里, 索引在 self._last_pcd_indices
+                self._analyze_pcd_attn_prefix(
                     self.vlm_with_expert._probe_attn_buf,
                     prefix_embs.shape[1],
                     suffix_embs.shape[1],
                 )
-            # 清理: 关探针, 释放 buf, 避免下次默认 forward 还在缓存
             self.vlm_with_expert._probe_attn = False
             self.vlm_with_expert._probe_attn_buf = []
-        # ============================================================
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -1566,139 +1719,6 @@ class VLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
-
-    def _analyze_pcd_attn(self, probs_list, prefix_len, suffix_len):
-        """
-        分析 attention probs, print 每层对 PCD 列的关注度.
-
-        probs_list: list of (B, num_heads, seq, seq), 一个 layer 一个 tensor.
-                    注意 seq 可能 < prefix_len + suffix_len (forward_attn_layer
-                    在 fill_kv_cache=False 模式下可能切短).
-        prefix_len: prefix 长度 (含 RGB / image_end / PCD / lang / state)
-        suffix_len: suffix 长度 (action expert tokens, chunk_size 个)
-        """
-        if not probs_list or not getattr(self, "_last_pcd_indices", None):
-            return
-
-        pcd_indices = self._last_pcd_indices
-        suffix_start = prefix_len  # expert query 起始位置 (理想情况)
-
-        # ---- 一次性 sanity check: 跳过形状不符或 PCD 越界的层 ----
-        # probs[k] 第三/第四维可能比 prefix_len 还小 (early layer w/ truncated mask).
-        # 也可能比 prefix_len+suffix_len 大 (kv cache 累积).
-        # 我们要求最小 shape 是 max(pcd_indices)+1, 否则跳过该层.
-        max_pcd_idx = max(pcd_indices)
-
-        non_pcd_prefix_rows_full = [
-            i for i in range(prefix_len) if i not in pcd_indices
-        ]
-
-        uniform = 1.0 / prefix_len
-        print(f"[AttnProbe] PCD indices in prefix: {pcd_indices} "
-              f"(prefix_len={prefix_len}, suffix_len={suffix_len}, uniform={uniform:.5f})")
-
-        for layer_idx, probs in enumerate(probs_list):
-            seq_len_k = probs.shape[-1]   # key 维度
-            seq_len_q = probs.shape[-2]   # query 维度
-
-            # 跳过 PCD column 越界
-            if seq_len_k <= max_pcd_idx:
-                print(f"[AttnProbe] L{layer_idx}: SKIP "
-                      f"(seq_len_k={seq_len_k} <= max_pcd_idx={max_pcd_idx})")
-                continue
-
-            # 限定 prefix rows 在合法范围内
-            non_pcd_rows_safe = [
-                i for i in non_pcd_prefix_rows_full if i < seq_len_q
-            ]
-
-            # 1) Expert query → PCD key
-            #    expert 行可能在 probs 里完全不存在 (seq_len_q <= prefix_len, 比如
-            #    fill_kv_cache=True path), 也可能存在.
-            if seq_len_q > suffix_start:
-                expert_q_end = min(suffix_start + suffix_len, seq_len_q)
-                expert_block = probs[:, :, suffix_start:expert_q_end, :][
-                    :, :, :, pcd_indices
-                ]
-                # NaN-safe: 用 nanmean 而不是 mean (causal mask 早期行可能全 0/NaN)
-                expert_to_pcd = torch.nanmean(expert_block.float())
-            else:
-                expert_to_pcd = torch.tensor(float("nan"))
-
-            # 2) Prefix query → PCD key
-            if non_pcd_rows_safe:
-                prefix_block = probs[:, :, non_pcd_rows_safe, :][
-                    :, :, :, pcd_indices
-                ]
-                prefix_to_pcd = torch.nanmean(prefix_block.float())
-            else:
-                prefix_to_pcd = torch.tensor(float("nan"))
-
-            e_val = expert_to_pcd.item()
-            p_val = prefix_to_pcd.item()
-            e_str = (
-                f"expert→PCD={e_val:.5f} ({e_val / uniform:.2f}× uniform)"
-                if e_val == e_val   # not NaN
-                else "expert→PCD=N/A (no expert rows in this layer)"
-            )
-            p_str = (
-                f"prefix→PCD={p_val:.5f} ({p_val / uniform:.2f}× uniform)"
-                if p_val == p_val
-                else "prefix→PCD=N/A"
-            )
-            print(f"[AttnProbe] L{layer_idx}: {e_str}  {p_str}")
-
-    def _analyze_pcd_attn_vlmout(self, probs_list, prefix_len, suffix_len, n_pcd):
-        """
-        expert-only (PCD_INJECT=1) AttnProbe. PCD 拼在 expert key 末尾 (cross + self-attn).
-        - cross-attn 层: q=suffix_len, k=prefix_len+n_pcd. PCD 在最后 n_pcd 列.
-          action query = suffix 末尾 chunk_size 行.
-        - self-attn 层: q=full_len(=prefix+suffix), k=full_len+n_pcd. PCD 在最后 n_pcd 列.
-          action query = full 末尾 chunk_size 行 (action 在 suffix 段末尾).
-        两种层都分析 action→PCD.
-        """
-        if not probs_list or n_pcd <= 0:
-            print(f"[AttnProbe-eo] no PCD (n_pcd={n_pcd}), skip")
-            return
-
-        chunk_size = self.config.chunk_size
-        full_len = prefix_len + suffix_len
-        shape_pairs = [(p.shape[-2], p.shape[-1]) for p in probs_list]
-        print(f"[AttnProbe-eo] prefix_len={prefix_len}, suffix_len={suffix_len}, "
-              f"full_len={full_len}, n_pcd={n_pcd}")
-        print(f"[AttnProbe-eo] (q,k) pairs: {shape_pairs}")
-
-        n_analyzed = 0
-        for layer_idx, probs in enumerate(probs_list):
-            q_len = probs.shape[-2]
-            k_len = probs.shape[-1]
-
-            if q_len == suffix_len and k_len >= prefix_len + n_pcd:
-                # cross-attn 层: action = 全部 suffix 末尾 chunk_size 行
-                mode = "cross"
-                action_q_start = max(0, suffix_len - chunk_size)
-                q_end = suffix_len
-            elif q_len >= full_len and k_len >= full_len + n_pcd:
-                # self-attn 层: action 在末尾 chunk_size 行 (suffix 段末尾)
-                mode = "self"
-                action_q_start = q_len - chunk_size
-                q_end = q_len
-            else:
-                continue
-
-            n_analyzed += 1
-            pcd_cols = list(range(k_len - n_pcd, k_len))   # PCD 在最后 n_pcd 列
-            uniform = 1.0 / k_len
-            action_block = probs[:, :, action_q_start:q_end, :][:, :, :, pcd_cols]
-            action_to_pcd = torch.nanmean(action_block.float()).item()
-            ratio = action_to_pcd / uniform if uniform > 0 else 0.0
-            print(f"[AttnProbe-eo] L{layer_idx} ({mode}, q={q_len},k={k_len}): "
-                  f"action→PCD={action_to_pcd:.5f} ({ratio:.2f}× uniform)")
-
-        if n_analyzed == 0:
-            print(f"[AttnProbe-eo] no layers with PCD found. (q,k): {shape_pairs}")
-        else:
-            print(f"[AttnProbe-eo] analyzed {n_analyzed} layers (PCD in last {n_pcd} key cols).")
 
     def sample_actions(
         self,

@@ -306,6 +306,8 @@ class SmolVLMWithExpertModel(nn.Module):
             vlm_layer = model_layers[0][layer_idx]
             if vlm_layer is not None:
                 _pcd = pcd_kv.to(dtype=vlm_layer.self_attn.k_proj.weight.dtype)
+                # PCD 也过 VLM 该层 input_layernorm, 保证 RMS≈1 跟正常 token 一致
+                _pcd = vlm_layer.input_layernorm(_pcd)
                 # 走 VLM k_proj/v_proj → (B, n_pcd, num_kv_heads, head_dim)
                 pcd_key = vlm_layer.self_attn.k_proj(_pcd).view(
                     *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
@@ -454,6 +456,11 @@ class SmolVLMWithExpertModel(nn.Module):
             if pcd_kv is not None and expert_key_states is not None:
                 vlm_layer = model_layers[0][layer_idx]
                 _pcd = pcd_kv.to(dtype=vlm_layer.self_attn.k_proj.weight.dtype)
+                # PCD 也过 VLM 该层的 input_layernorm (跟正常 token 路径一致),
+                # 保证 RMS≈1 输入 k/v_proj. 不加 norm 会让 PCD magnitude 跟正常
+                # token 不一致, 污染 attention. RMSNorm 无 bias, 只 rescale, 不
+                # 破坏几何信息.
+                _pcd = vlm_layer.input_layernorm(_pcd)
                 # 第一段: VLM k_proj/v_proj (跟 prefix key 同一套)
                 pcd_key_vlm = vlm_layer.self_attn.k_proj(_pcd).view(
                     *_pcd.shape[:-1], -1, vlm_layer.self_attn.head_dim
@@ -656,18 +663,12 @@ class SmolVLMWithExpertModel(nn.Module):
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
 
-        # ======================== ATTENTION PROBE HOOK ========================
-        # 当外部代码 (e.g. modeling_smolvla.py 的 embed_prefix) 设置
-        # self._probe_attn = True 时, 把每个 layer 的 attention probs 缓存到
-        # self._probe_attn_buf, 由外部代码消费. 不设置时零开销 (no detach, no
-        # store), 不影响生产训练.
-        # ----------------------------------------------------------------------
+        # AttnProbe hook (prefix 模式专用): 外部设 self._probe_attn=True 时缓存 probs.
+        # 仅在偶尔 probe step 启用, 不设时零开销.
         if getattr(self, "_probe_attn", False):
             if not hasattr(self, "_probe_attn_buf"):
                 self._probe_attn_buf = []
-            # detach 避免梯度图保留 attention probs (大内存占用)
             self._probe_attn_buf.append(probs.detach())
-        # ======================================================================
 
         probs = probs.to(dtype=value_states.dtype)
 

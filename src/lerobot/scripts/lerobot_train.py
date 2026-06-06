@@ -131,68 +131,6 @@ def update_policy(
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    # ============================================================
-    # Grad norm 分组诊断 (clip 之前的 raw 数据)
-    # ----------------------------------------------------------------
-    # 每 100 步算一次 PCD encoder vs 其他参数的 grad 占比
-    # 用于判断梯度是否被 PCD 部分 dominate
-    # ============================================================
-    if not hasattr(update_policy, "_grad_diag_step"):
-        update_policy._grad_diag_step = 0
-    update_policy._grad_diag_step += 1
-
-    if update_policy._grad_diag_step % 100 == 1:
-        try:
-            inner_policy = accelerator.unwrap_model(policy)
-            inner_model = getattr(inner_policy, "model", None)
-
-            pcd_param_ids = set()
-            if (inner_model is not None
-                    and getattr(inner_model, "use_pcd", False)
-                    and getattr(inner_model, "pcd_encoder_agent", None) is not None):
-                for enc in [inner_model.pcd_encoder_agent, inner_model.pcd_encoder_wrist]:
-                    for p in enc.parameters():
-                        if p.requires_grad:
-                            pcd_param_ids.add(id(p))
-                # PCD_VLMOUT=1 模式: 标量(固定不算) + 瓶颈 MLP 算 PCD energy
-                for _attr in ["pcd_vlmout_scale_agent", "pcd_vlmout_scale_wrist"]:
-                    _p = getattr(inner_model, _attr, None)
-                    if _p is not None and hasattr(_p, "requires_grad") and _p.requires_grad:
-                        pcd_param_ids.add(id(_p))
-                for _attr in ["pcd_vlmout_mlp_agent", "pcd_vlmout_mlp_wrist"]:
-                    _mod = getattr(inner_model, _attr, None)
-                    if _mod is not None:
-                        for p in _mod.parameters():
-                            if p.requires_grad:
-                                pcd_param_ids.add(id(p))
-
-            pcd_norm_sq = 0.0
-            other_norm_sq = 0.0
-            n_pcd = 0
-            n_other = 0
-            for p in policy.parameters():
-                if p.grad is None:
-                    continue
-                g_norm_sq = p.grad.float().norm().item() ** 2
-                if id(p) in pcd_param_ids:
-                    pcd_norm_sq += g_norm_sq
-                    n_pcd += 1
-                else:
-                    other_norm_sq += g_norm_sq
-                    n_other += 1
-            total_sq = pcd_norm_sq + other_norm_sq
-            total_norm = total_sq ** 0.5
-            pcd_pct = 100.0 * (pcd_norm_sq / total_sq) if total_sq > 0 else 0.0
-
-            logging.info(
-                f"[GRAD-DIAG] step={update_policy._grad_diag_step}  "
-                f"total={total_norm:.4f}  "
-                f"pcd={pcd_norm_sq**0.5:.4f} ({pcd_pct:.2f}% of energy, {n_pcd} tensors)  "
-                f"other={other_norm_sq**0.5:.4f} ({n_other} tensors)"
-            )
-        except Exception as e:
-            logging.warning(f"[GRAD-DIAG] failed: {e}")
-
     # Clip gradients if specified
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
